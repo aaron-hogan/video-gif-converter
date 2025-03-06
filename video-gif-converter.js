@@ -713,6 +713,20 @@ async function downloadVideoSegment(videoId, videoInfo, startTime, duration, out
       
       videoStream.on('error', (streamErr) => {
         console.error('Error downloading video stream:', streamErr.message);
+        
+        // Provide more helpful error messages for common issues
+        if (streamErr.message.includes('403')) {
+          console.error('\nAccess denied (403 Forbidden) when downloading this video.');
+          console.error('This can happen due to:');
+          console.error('  - Age-restricted videos');
+          console.error('  - Geo-restricted videos');
+          console.error('  - Videos with copyright strikes');
+          console.error('  - Recent changes in YouTube\'s access policies');
+          console.error('\nTry downloading the video manually and use the -i option instead:');
+          console.error(`  yt-dlp "${options.url}" -o video.mp4`);
+          console.error(`  vgif -i video.mp4 -s ${options.start} -d ${options.duration} -c ${options.crossfade} -w ${options.width}`);
+        }
+        
         reject(streamErr);
       });
       
@@ -1453,6 +1467,17 @@ async function run() {
         );
       } catch (error) {
         console.error('Error downloading video segment:', error.message);
+        
+        if (error.message.includes('403') || error.message.includes('Forbidden')) {
+          console.error('\nAccess denied when downloading this video. This is likely due to restrictions on the video.');
+          console.error('Try an alternative approach:');
+          console.error('1. Install yt-dlp (https://github.com/yt-dlp/yt-dlp#installation)');
+          console.error(`2. Download the video: yt-dlp "${options.url}" -o video.mp4`);
+          console.error(`3. Create the GIF: vgif -i video.mp4 -s ${options.start} -d ${options.duration} -c ${options.crossfade} -w ${options.width}`);
+        } else if (error.message.includes('429') || error.message.includes('Too Many Requests')) {
+          console.error('\nToo many requests sent to YouTube. Please wait a while and try again.');
+        }
+        
         if (options.verbose) {
           console.error('Error details:', error);
         }
