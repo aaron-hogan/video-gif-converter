@@ -264,30 +264,50 @@ async function run() {
           return;
         }
         
-        // Here's a simpler, more reliable approach for looping crossfade
-        console.log('Using simplified crossfade approach for reliable looping...');
+        // Let's use the most direct and reliable approach for a true crossfade
+        console.log('Creating a proper crossfade transition with concatenation...');
         
-        // Create the loop with crossfade using a custom filter
+        // The crossfade duration
         const fadeDuration = crossfadeDuration;
-        const totalDuration = actualDuration;
-        const startFade = totalDuration - fadeDuration;
         
-        // This is a manual two-part conversion to ensure the best results
+        // Calculate timing for a perfect loop
+        const mainDuration = actualDuration - fadeDuration; // Full duration minus the overlap
         
-        // First create a crossfaded and scaled video clip
+        // Create two temporary segments that will be combined
+        const firstSegPath = path.join(tempDir, 'first_segment.mp4');
+        const lastSegPath = path.join(tempDir, 'last_segment.mp4');
+        
+        // Extract the main portion (everything except the crossfade duration at the end)
+        await new Promise((resolveFirst, rejectFirst) => {
+          ffmpeg(loopSegmentPath)
+            .setStartTime(0)
+            .duration(mainDuration)
+            .output(firstSegPath)
+            .on('end', resolveFirst)
+            .on('error', rejectFirst)
+            .run();
+        });
+        
+        // Extract the beginning portion again (just the crossfade duration)
+        await new Promise((resolveLast, rejectLast) => {
+          ffmpeg(loopSegmentPath)
+            .setStartTime(0)
+            .duration(fadeDuration)
+            .output(lastSegPath)
+            .on('end', resolveLast)
+            .on('error', rejectLast)
+            .run();
+        });
+        
+        // Now create a crossfade between these segments using FFmpeg's dedicated xfade filter
         const crossfadedPath = path.join(tempDir, 'crossfaded.mp4');
         await new Promise((resolveCrossfade, rejectCrossfade) => {
-          // Use a simpler approach with fadein/fadeout that works reliably
-          ffmpeg(loopSegmentPath)
+          ffmpeg()
+            .input(firstSegPath)  // First part of the video
+            .input(lastSegPath)   // The beginning part that will be used for the loop
             .complexFilter([
-              // First create a copy of the clip for the looping portion
-              '[0:v]split[main][loop]',
-              // Take the main part and add a fadeout at the end
-              `[main]trim=0:${totalDuration},setpts=PTS-STARTPTS,fade=t=out:st=${startFade}:d=${fadeDuration}[fadeout]`,
-              // Take just the beginning part to overlap and add fadein
-              `[loop]trim=0:${fadeDuration},setpts=PTS-STARTPTS,fade=t=in:st=0:d=${fadeDuration}[fadein]`,
-              // Overlay the fadein portion on top of the fadeout portion
-              '[fadeout][fadein]overlay'
+              // Use the xfade filter - simpler and reliable
+              `xfade=transition=fade:duration=${fadeDuration}:offset=${mainDuration-fadeDuration}`
             ])
             .outputOptions(['-pix_fmt', 'yuv420p'])
             .output(crossfadedPath)
