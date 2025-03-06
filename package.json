@@ -4,7 +4,7 @@
   "description": "CLI to convert YouTube videos or local video files to looping GIFs",
   "main": "video-gif-converter.js",
   "bin": {
-    "video-gif-converter": "./video-gif-converter.js"
+    "vgif": "./video-gif-converter.js"
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"

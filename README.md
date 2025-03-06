@@ -65,6 +65,7 @@ video-gif-converter --input "path/to/video.mp4"
 - `-w, --width <pixels>` - Width of the GIF in pixels (default: 480)
 - `-f, --fps <fps>` - Frames per second (default: 15)
 - `-l, --loops <count>` - Number of loops (0 = infinite) (default: 0)
+- `-c, --crossfade <seconds>` - Add crossfade effect between loop ends (default: 0)
 - `-v, --verbose` - Enable verbose logging and show progress information
 - `-m, --max-size <mb>` - Maximum output file size in MB (default: 50)
 
@@ -77,28 +78,34 @@ Note: You must provide either a YouTube URL (-u) OR a local file path (-i), not 
 # ---------------
 
 # Create a 10-second GIF starting from 30 seconds into the video
-video-gif-converter -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -s 30 -d 10
+vgif -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -s 30 -d 10
 
 # Create a high-quality GIF with custom dimensions and fps
-video-gif-converter -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -w 720 -f 30 -o my-gif.gif
+vgif -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -w 720 -f 30 -o my-gif.gif
 
 # Create a GIF that loops 3 times
-video-gif-converter -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -l 3
+vgif -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -l 3
+
+# Create a GIF with a 0.5 second crossfade between the end and beginning
+vgif -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -d 5 -c 0.5
 
 # Local File Examples
 # ------------------
 
 # Create a GIF from a local video file
-video-gif-converter -i "path/to/video.mp4" -o output.gif
+vgif -i "path/to/video.mp4" -o output.gif
 
 # Create a GIF from a specific segment of a local video
-video-gif-converter -i "path/to/movie.mp4" -s 120 -d 5 -w 480 -f 20 -o movie-scene.gif 
+vgif -i "path/to/movie.mp4" -s 120 -d 5 -w 480 -f 20 -o movie-scene.gif 
 
 # Create a smaller file size GIF with lower FPS
-video-gif-converter -i "path/to/video.mp4" -f 10 -w 320
+vgif -i "path/to/video.mp4" -f 10 -w 320
+
+# Create a seamless looping GIF with crossfade
+vgif -i "path/to/video.mp4" -d 3 -c 0.5
 
 # Enable verbose mode to see conversion progress
-video-gif-converter -i "path/to/video.mp4" -v
+vgif -i "path/to/video.mp4" -v
 ```
 
 ### Tips
@@ -107,6 +114,7 @@ video-gif-converter -i "path/to/video.mp4" -v
 2. **Duration**: Shorter GIFs (2-8 seconds) tend to be more shareable and load faster
 3. **File Size**: Reducing width (`-w`) and frame rate (`-f`) will create smaller files
 4. **Loop Count**: Use `-l 0` for infinite loops or specify a number for limited loops
+5. **Smooth Looping**: Use the crossfade option (`-c`) to create seamless transitions between loop ends
 
 ## License
 
