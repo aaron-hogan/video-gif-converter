@@ -8,6 +8,7 @@ const path = require('path');
 const os = require('os');
 const { execFile } = require('child_process');
 const gifsicle = require('gifsicle');
+const v8 = require('v8');
 
 // Check if FFmpeg is installed
 try {
@@ -46,7 +47,7 @@ try {
 program
   .name('vgif')
   .description('CLI to convert YouTube videos or local video files to looping GIFs')
-  .version('1.0.0')
+  .version('1.1.0')
   .option('-u, --url <url>', 'YouTube video URL')
   .option('-i, --input <filepath>', 'Local video file path')
   .option('-s, --start <seconds>', 'Start time in seconds', '0')
@@ -62,6 +63,8 @@ program
   .option('--colors <number>', 'Maximum number of colors in the palette (2-256, fewer colors = smaller files)', '256')
   .option('--lossy <level>', 'Lossy compression level (1-100, higher = smaller files but lower quality)', '80') 
   .option('--dither <type>', 'Dithering method (none, floyd_steinberg, bayer, sierra2_4a)', 'sierra2_4a')
+  .option('--memory-limit <mb>', 'Maximum memory usage in MB (0 = no limit)', '2048')
+  .option('--threads <count>', 'Number of FFmpeg threads to use (0 = auto)', '0')
   .parse(process.argv);
 
 const options = program.opts();
@@ -71,6 +74,8 @@ options.crossfade = parseFloat(options.crossfade);
 options.speed = parseFloat(options.speed);
 options.colors = parseInt(options.colors);
 options.lossy = parseInt(options.lossy);
+options.memoryLimit = parseInt(options.memoryLimit);
+options.threads = parseInt(options.threads);
 
 // Validate speed option
 if (isNaN(options.speed) || options.speed <= 0) {
@@ -99,6 +104,66 @@ const validDithers = ['none', 'floyd_steinberg', 'bayer', 'sierra2_4a'];
 if (!validDithers.includes(options.dither)) {
   console.error(`Error: Dither must be one of: ${validDithers.join(', ')}`);
   process.exit(1);
+}
+
+// Validate memory limit and threads options
+if (options.memoryLimit < 0) {
+  console.error('Error: Memory limit must be a non-negative number');
+  process.exit(1);
+}
+
+if (options.threads < 0) {
+  console.error('Error: Thread count must be a non-negative number');
+  process.exit(1);
+}
+
+/**
+ * Get the current memory usage
+ * @returns {Object} Memory usage statistics in MB
+ */
+function getMemoryUsage() {
+  const memoryUsage = process.memoryUsage();
+  const v8HeapStats = v8.getHeapStatistics();
+  
+  return {
+    rss: Math.round(memoryUsage.rss / (1024 * 1024)), // Resident Set Size in MB
+    heapTotal: Math.round(memoryUsage.heapTotal / (1024 * 1024)), // Total size of the allocated heap
+    heapUsed: Math.round(memoryUsage.heapUsed / (1024 * 1024)), // Actual memory used during execution
+    external: Math.round(memoryUsage.external / (1024 * 1024)), // Memory used by C++ objects bound to JavaScript
+    heapSizeLimit: Math.round(v8HeapStats.heap_size_limit / (1024 * 1024)), // V8 heap size limit
+    totalSystemMemory: Math.round(os.totalmem() / (1024 * 1024)), // Total system memory in MB
+    freeSystemMemory: Math.round(os.freemem() / (1024 * 1024)), // Free system memory in MB
+  };
+}
+
+/**
+ * Check if memory usage exceeds the limit
+ * @returns {boolean} True if memory limit is exceeded, false otherwise
+ */
+function isMemoryLimitExceeded() {
+  if (options.memoryLimit <= 0) {
+    return false; // No limit set
+  }
+  
+  const memUsage = getMemoryUsage();
+  return memUsage.rss > options.memoryLimit;
+}
+
+/**
+ * Log memory usage if verbose mode is enabled
+ */
+function logMemoryUsage() {
+  if (!options.verbose) return;
+  
+  const memUsage = getMemoryUsage();
+  console.log('Memory usage:');
+  console.log(`  Process RSS: ${memUsage.rss}MB`);
+  console.log(`  Heap used: ${memUsage.heapUsed}MB / ${memUsage.heapTotal}MB`);
+  console.log(`  System memory: ${memUsage.freeSystemMemory}MB free of ${memUsage.totalSystemMemory}MB`);
+  
+  if (options.memoryLimit > 0) {
+    console.log(`  Memory limit: ${options.memoryLimit}MB (${Math.round(memUsage.rss / options.memoryLimit * 100)}% used)`);
+  }
 }
 
 // Function to check if crossfade is enabled
@@ -298,15 +363,46 @@ async function processCrossfade(videoPath, tempDir, outputPath, hwAccel = { avai
       }
       */
       
-      ffmpeg(videoPath)
+      // Log memory usage before processing
+      logMemoryUsage();
+      
+      // Check if memory limit is already exceeded
+      if (isMemoryLimitExceeded()) {
+        console.warn('Warning: Memory limit already exceeded before processing');
+        if (options.memoryLimit > 0) {
+          console.warn(`Current memory usage: ${getMemoryUsage().rss}MB, limit: ${options.memoryLimit}MB`);
+        }
+      }
+      
+      let command = ffmpeg(videoPath)
         .complexFilter(complexFilter)
         .output(tempVideoPath)
-        .outputOptions(['-map', '0:a?']) // Include audio if present
-        .on('start', (commandLine) => {
-          if (options.verbose) {
-            console.log('FFmpeg command:', commandLine);
-          }
-        })
+        .outputOptions(['-map', '0:a?']); // Include audio if present
+        
+      // Apply threading options if specified
+      if (options.threads > 0) {
+        command.outputOptions([
+          `-threads ${options.threads}`
+        ]);
+        if (options.verbose) {
+          console.log(`Using ${options.threads} FFmpeg threads for crossfade processing`);
+        }
+      } else if (options.threads === 0) {
+        // Auto-threading mode - use CPU core count
+        const cpuCount = os.cpus().length;
+        command.outputOptions([
+          `-threads ${cpuCount}`
+        ]);
+        if (options.verbose) {
+          console.log(`Using auto-threading with ${cpuCount} CPU cores for crossfade processing`);
+        }
+      }
+        
+      command.on('start', (commandLine) => {
+        if (options.verbose) {
+          console.log('FFmpeg command:', commandLine);
+        }
+      })
         .on('end', () => {
           console.log('Crossfade video created successfully');
           
@@ -328,6 +424,9 @@ async function processCrossfade(videoPath, tempDir, outputPath, hwAccel = { avai
             throw err;
           }
           
+          // Log memory usage before second pass
+          logMemoryUsage();
+          
           // Optimized single-pass approach for crossfade GIF
           console.log('Creating optimized GIF with single-pass filtergraph...');
           
@@ -340,6 +439,25 @@ async function processCrossfade(videoPath, tempDir, outputPath, hwAccel = { avai
             hwAccel.options.forEach(option => {
               ffmpegCrossfade.inputOption(option);
             });
+          }
+          
+          // Apply threading options
+          if (options.threads > 0) {
+            ffmpegCrossfade.outputOptions([
+              `-threads ${options.threads}`
+            ]);
+            if (options.verbose) {
+              console.log(`Using ${options.threads} FFmpeg threads for GIF creation`);
+            }
+          } else if (options.threads === 0) {
+            // Auto-threading mode - use CPU core count
+            const cpuCount = os.cpus().length;
+            ffmpegCrossfade.outputOptions([
+              `-threads ${cpuCount}`
+            ]);
+            if (options.verbose) {
+              console.log(`Using auto-threading with ${cpuCount} CPU cores for GIF creation`);
+            }
           }
           
           ffmpegCrossfade
@@ -506,12 +624,35 @@ async function preprocessVideoSpeed(inputPath, tempDir, speed) {
     
     console.log(`Preprocessing video to ${speed}x speed...`);
     
+    // Log memory usage if enabled
+    logMemoryUsage();
+    
     // Apply speed effect using setpts filter
     // Note: setpts=1/speed*PTS makes the video faster when speed > 1.0 and slower when speed < 1.0
-    ffmpeg(inputPath)
+    let command = ffmpeg(inputPath)
       .videoFilter(`setpts=1/${speed}*PTS`)
-      .audioFilter(`atempo=${speed}`) // Adjust audio speed too if present
-      .output(speedAdjustedPath)
+      .audioFilter(`atempo=${speed}`); // Adjust audio speed too if present
+    
+    // Apply threading options if specified
+    if (options.threads > 0) {
+      command.outputOptions([
+        `-threads ${options.threads}`
+      ]);
+      if (options.verbose) {
+        console.log(`Using ${options.threads} FFmpeg threads for speed preprocessing`);
+      }
+    } else if (options.threads === 0) {
+      // Auto-threading mode - use CPU core count
+      const cpuCount = os.cpus().length;
+      command.outputOptions([
+        `-threads ${cpuCount}`
+      ]);
+      if (options.verbose) {
+        console.log(`Using auto-threading with ${cpuCount} CPU cores for speed preprocessing`);
+      }
+    }
+    
+    command.output(speedAdjustedPath)
       .on('start', (commandLine) => {
         if (options.verbose) {
           console.log('Speed preprocessing command:', commandLine);
@@ -519,6 +660,8 @@ async function preprocessVideoSpeed(inputPath, tempDir, speed) {
       })
       .on('end', () => {
         console.log('Speed preprocessing complete');
+        // Log memory usage after processing if enabled
+        logMemoryUsage();
         // Don't clean up the original file here - it will be handled after this function returns
         resolve(speedAdjustedPath);
       })
@@ -806,6 +949,17 @@ async function run() {
         console.log(`Converting video to GIF${speedInfo} (this may take a while)...`);
         console.log(`Settings: ${options.duration}s duration, ${options.width}px width, ${options.fps} FPS`);
         
+        // Log memory usage before processing
+        logMemoryUsage();
+        
+        // Check if memory limit is already exceeded
+        if (isMemoryLimitExceeded()) {
+          console.warn('Warning: Memory limit already exceeded before processing');
+          if (options.memoryLimit > 0) {
+            console.warn(`Current memory usage: ${getMemoryUsage().rss}MB, limit: ${options.memoryLimit}MB`);
+          }
+        }
+        
         // Generate a palette for better quality
         const palettePath = path.join(tempDir, 'palette.png');
         
@@ -820,6 +974,25 @@ async function run() {
           hwAccel.options.forEach(option => {
             ffmpegCommand.inputOption(option);
           });
+        }
+        
+        // Add threading options
+        if (options.threads > 0) {
+          ffmpegCommand.outputOptions([
+            `-threads ${options.threads}`
+          ]);
+          if (options.verbose) {
+            console.log(`Using ${options.threads} FFmpeg threads for GIF creation`);
+          }
+        } else if (options.threads === 0) {
+          // Auto-threading mode - use CPU core count
+          const cpuCount = os.cpus().length;
+          ffmpegCommand.outputOptions([
+            `-threads ${cpuCount}`
+          ]);
+          if (options.verbose) {
+            console.log(`Using auto-threading with ${cpuCount} CPU cores for GIF creation`);
+          }
         }
           
         // Use a single complex filtergraph that generates a palette and applies it in one step
@@ -848,6 +1021,9 @@ async function run() {
             }
           })
           .on('end', async () => {
+            // Log memory usage after processing
+            logMemoryUsage();
+            
             // Clean up the processed video file if it was temporary
             if (processedVideoPath !== videoPath) {
               cleanupTempFile(processedVideoPath);
@@ -859,6 +1035,13 @@ async function run() {
             } catch (err) {
               console.error('Error during post-processing:', err.message);
             }
+            
+            // Log final memory usage
+            if (options.verbose) {
+              console.log('Final memory usage after GIF creation:');
+              logMemoryUsage();
+            }
+            
             console.log(`Success! GIF saved to: ${path.resolve(outputPath)}`);
             resolve();
           })
@@ -889,15 +1072,35 @@ async function run() {
                 // Final fallback - simpler method
                 console.log('Using basic conversion as final fallback...');
                 
+                // Log memory usage before fallback
+                logMemoryUsage();
+                
                 let fallbackFfmpeg = ffmpeg(processedVideoPath)
                   .setStartTime(options.start);
+                
+                // Add threading options to fallback method
+                const threadOptions = [];
+                if (options.threads > 0) {
+                  threadOptions.push(`-threads ${options.threads}`);
+                  if (options.verbose) {
+                    console.log(`Using ${options.threads} FFmpeg threads for fallback conversion`);
+                  }
+                } else if (options.threads === 0) {
+                  // Auto-threading mode - use CPU core count
+                  const cpuCount = os.cpus().length;
+                  threadOptions.push(`-threads ${cpuCount}`);
+                  if (options.verbose) {
+                    console.log(`Using auto-threading with ${cpuCount} CPU cores for fallback conversion`);
+                  }
+                }
                 
                 // Standard approach
                   fallbackFfmpeg
                     .duration(options.duration)
                     .outputOptions([
                       '-vf', `fps=${options.fps},scale=${options.width}:-1:flags=lanczos`,
-                      '-loop', options.loops
+                      '-loop', options.loops,
+                      ...threadOptions
                     ])
                     .format('gif')
                     .output(outputPath);

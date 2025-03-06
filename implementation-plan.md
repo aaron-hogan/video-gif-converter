@@ -68,12 +68,12 @@ This document outlines our step-by-step plan to optimize the Video GIF Converter
 
 - [x] **Step 2: Resource Management**
   - [x] 2.1 Add immediate temp file cleanup after each processing step
-  - [ ] 2.2 Implement memory usage monitoring
+  - [x] 2.2 Implement memory usage monitoring
   - [ ] 2.3 Add streaming processing for large files
-  - [ ] 2.4 Create resource usage limits based on available system memory
+  - [x] 2.4 Create resource usage limits based on available system memory
 
-- [ ] **Step 3: Parallelization**
-  - [ ] 3.1 Add FFmpeg threading options to all processing steps
+- [x] **Step 3: Parallelization**
+  - [x] 3.1 Add FFmpeg threading options to all processing steps
   - [ ] 3.2 Implement parallel processing for independent operations
   - [ ] 3.3 Create worker thread pool for CPU-intensive tasks
   - [ ] 3.4 Add unified progress tracking for parallel operations
