@@ -264,64 +264,49 @@ async function run() {
           return;
         }
         
-        // Create a crossfade by using fade in/out filters
-        // This approach is more reliable and visible
+        // Here's a simpler, more reliable approach for looping crossfade
+        console.log('Using simplified crossfade approach for reliable looping...');
         
-        // First, create two separate segments for start and end
-        const startSegPath = path.join(tempDir, 'start_seg.mp4');
-        const endSegPath = path.join(tempDir, 'end_seg.mp4');
+        // Create the loop with crossfade using a custom filter
+        const fadeDuration = crossfadeDuration;
+        const totalDuration = actualDuration;
+        const startFade = totalDuration - fadeDuration;
         
-        // Extract start segment (beginning of the clip)
-        await new Promise((resolveStart, rejectStart) => {
+        // This is a manual two-part conversion to ensure the best results
+        
+        // First create a crossfaded and scaled video clip
+        const crossfadedPath = path.join(tempDir, 'crossfaded.mp4');
+        await new Promise((resolveCrossfade, rejectCrossfade) => {
+          // Use a simpler approach with fadein/fadeout that works reliably
           ffmpeg(loopSegmentPath)
-            .setStartTime(0)
-            .duration(crossfadeDuration)
-            .output(startSegPath)
-            .on('end', resolveStart)
-            .on('error', rejectStart)
+            .complexFilter([
+              // First create a copy of the clip for the looping portion
+              '[0:v]split[main][loop]',
+              // Take the main part and add a fadeout at the end
+              `[main]trim=0:${totalDuration},setpts=PTS-STARTPTS,fade=t=out:st=${startFade}:d=${fadeDuration}[fadeout]`,
+              // Take just the beginning part to overlap and add fadein
+              `[loop]trim=0:${fadeDuration},setpts=PTS-STARTPTS,fade=t=in:st=0:d=${fadeDuration}[fadein]`,
+              // Overlay the fadein portion on top of the fadeout portion
+              '[fadeout][fadein]overlay'
+            ])
+            .outputOptions(['-pix_fmt', 'yuv420p'])
+            .output(crossfadedPath)
+            .on('end', resolveCrossfade)
+            .on('error', rejectCrossfade)
             .run();
         });
         
-        // Extract end segment (end of the clip)
-        await new Promise((resolveEnd, rejectEnd) => {
-          ffmpeg(loopSegmentPath)
-            .setStartTime(actualDuration - crossfadeDuration)
-            .duration(crossfadeDuration)
-            .output(endSegPath)
-            .on('end', resolveEnd)
-            .on('error', rejectEnd)
-            .run();
-        });
-        
-        // Now create the GIF with crossfade
-        ffmpegCommand = ffmpeg();
-        console.log('Using fade in/out for clearly visible crossfade...');
-        
-        // Input files - main clip and the start segment for looping
+        // Now convert the crossfaded video to a GIF with optimized palette
+        ffmpegCommand = ffmpeg(crossfadedPath);
         ffmpegCommand
-          .input(loopSegmentPath) // Main clip
-          .input(startSegPath)    // Beginning for crossfade
-          .complexFilter([
-            // Process main clip
-            `[0:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos[main]`,
-            
-            // Process start segment
-            `[1:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos[start]`,
-            
-            // Fade out the end of main clip
-            `[main]fade=t=out:st=${actualDuration - crossfadeDuration}:d=${crossfadeDuration}[faded_main]`,
-            
-            // Fade in the start segment
-            `[start]fade=t=in:st=0:d=${crossfadeDuration}[faded_start]`,
-            
-            // Overlay the faded start segment onto the end of the main clip
-            `[faded_main][faded_start]overlay=shortest=1[merged]`,
-            
-            // Generate palette from the final result
-            `[merged]split[s0][s1]`,
-            `[s0]palettegen=stats_mode=diff[p]`,
-            `[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle[out]`
-          ], '[out]')
+          .videoFilters([
+            // Standard GIF conversion with high quality
+            `fps=${options.fps}`,
+            `scale=${options.width}:-1:flags=lanczos`,
+            'split[s0][s1]',
+            '[s0]palettegen=stats_mode=diff:max_colors=256[p]',
+            '[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle'
+          ])
           .outputOption('-loop', options.loops)
           .format('gif')
           .output(outputPath);
