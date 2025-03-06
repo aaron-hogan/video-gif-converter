@@ -241,6 +241,11 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
     // Create a temporary video with crossfade
     const tempVideoPath = path.join(tempDir, 'crossfade_video.mp4');
     
+    // Track this temp file for cleanup if needed
+    if (typeof trackTempFile === 'function') {
+      trackTempFile(tempVideoPath);
+    }
+    
     // Parse durations and calculate timing
     const totalDuration = parseFloat(options.duration);
     const crossfadeDuration = options.crossfade;
@@ -348,6 +353,9 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
             .format('gif')
             .save(outputPath) // Use save() instead of output().run()
             .on('end', async () => {
+              // Clean up the temporary crossfade video immediately
+              cleanupTempFile(tempVideoPath);
+              
               // Apply post-processing with gifsicle for better compression
               try {
                 await postProcessGif(outputPath, options);
@@ -487,6 +495,11 @@ async function preprocessVideoSpeed(inputPath, tempDir, speed) {
   return new Promise((resolve, reject) => {
     const speedAdjustedPath = path.join(tempDir, 'speed_adjusted.mp4');
     
+    // Track this temp file for cleanup if needed
+    if (typeof trackTempFile === 'function') {
+      trackTempFile(speedAdjustedPath);
+    }
+    
     console.log(`Preprocessing video to ${speed}x speed...`);
     
     // Apply speed effect using setpts filter
@@ -502,6 +515,7 @@ async function preprocessVideoSpeed(inputPath, tempDir, speed) {
       })
       .on('end', () => {
         console.log('Speed preprocessing complete');
+        // Don't clean up the original file here - it will be handled after this function returns
         resolve(speedAdjustedPath);
       })
       .on('error', (err) => {
@@ -519,6 +533,7 @@ async function run() {
   let videoPath = null;
   let processedVideoPath = null;
   let usingTempVideo = false;
+  let tempFiles = [];
   
   // Detect hardware acceleration capabilities
   const hwAccel = await detectHardwareAcceleration();
@@ -526,6 +541,34 @@ async function run() {
   try {
     // Create temp directory
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'youtube-gif-'));
+    
+    // Create a function to clean up temp files immediately
+    const cleanupTempFile = (filePath) => {
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+          
+          // Remove from the tracked temp files array if present
+          const index = tempFiles.indexOf(filePath);
+          if (index > -1) {
+            tempFiles.splice(index, 1);
+          }
+          
+          if (options.verbose) {
+            console.log(`Cleaned up temp file: ${filePath}`);
+          }
+        } catch (err) {
+          console.warn(`Failed to clean up temp file ${filePath}: ${err.message}`);
+        }
+      }
+    };
+    
+    // Create a function to track temp files for later cleanup
+    const trackTempFile = (filePath) => {
+      if (filePath && !tempFiles.includes(filePath)) {
+        tempFiles.push(filePath);
+      }
+    };
     
     // Function to find a non-conflicting filename
     function getUniqueFilePath(basePath) {
@@ -586,6 +629,7 @@ async function run() {
     if (options.url) {
       videoPath = path.join(tempDir, 'video.mp4');
       usingTempVideo = true;
+      trackTempFile(videoPath);
       
       console.log('Validating YouTube URL...');
       
@@ -698,6 +742,12 @@ async function run() {
     
     // Apply speed preprocessing if needed
     processedVideoPath = await preprocessVideoSpeed(videoPath, tempDir, options.speed);
+    
+    // Clean up original video file if it was a temp file and is different from processed path
+    if (usingTempVideo && videoPath !== processedVideoPath) {
+      cleanupTempFile(videoPath);
+    }
+    
     // From this point on, use processedVideoPath instead of videoPath
     
     // Calculate file size estimate and warn for large files
@@ -794,6 +844,11 @@ async function run() {
             }
           })
           .on('end', async () => {
+            // Clean up the processed video file if it was temporary
+            if (processedVideoPath !== videoPath) {
+              cleanupTempFile(processedVideoPath);
+            }
+            
             // Apply post-processing with gifsicle for better compression
             try {
               await postProcessGif(outputPath, options);
@@ -949,13 +1004,29 @@ async function run() {
     }
     process.exit(1);
   } finally {
+    // Clean up any tracked temp files that weren't already cleaned up
+    if (tempFiles.length > 0) {
+      tempFiles.forEach(filePath => {
+        try {
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            if (options.verbose) {
+              console.log(`Final cleanup of temp file: ${filePath}`);
+            }
+          }
+        } catch (err) {
+          console.warn(`Warning: Could not clean up temp file: ${filePath}`);
+        }
+      });
+    }
+    
     // Clean up temp directory and files if we created them
     if (tempDir && fs.existsSync(tempDir)) {
       try {
         // Get all files in the temp directory
         const files = fs.readdirSync(tempDir);
         
-        // Delete each file
+        // Delete each file that might have been missed
         files.forEach(file => {
           const filePath = path.join(tempDir, file);
           if (fs.existsSync(filePath)) {
