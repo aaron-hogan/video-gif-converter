@@ -1,0 +1,26 @@
+{
+  "name": "video-gif-converter",
+  "version": "1.0.0",
+  "description": "CLI to convert YouTube videos or local video files to looping GIFs",
+  "main": "index.js",
+  "bin": {
+    "video-gif-converter": "./index.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "youtube",
+    "gif",
+    "convert",
+    "cli",
+    "video"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@distube/ytdl-core": "^4.16.4",
+    "commander": "^13.1.0",
+    "fluent-ffmpeg": "^2.1.3"
+  }
+}
