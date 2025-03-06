@@ -229,9 +229,10 @@ if (options.url && options.input) {
  * @param {string} videoPath - Path to the source video
  * @param {string} tempDir - Temporary directory for processing files
  * @param {string} outputPath - Path where the final GIF will be saved
+ * @param {object} hwAccel - Hardware acceleration object with detection results
  * @returns {Promise} - Resolves when GIF is created
  */
-async function processCrossfade(videoPath, tempDir, outputPath) {
+async function processCrossfade(videoPath, tempDir, outputPath, hwAccel = { available: false }) {
   try {
     console.log('Creating crossfade effect directly...');
     
@@ -793,8 +794,8 @@ async function run() {
         process.exit(1);
       }
       
-      // Process with crossfade effect
-      await processCrossfade(processedVideoPath, tempDir, outputPath);
+      // Process with crossfade effect - pass the hardware acceleration object
+      await processCrossfade(processedVideoPath, tempDir, outputPath, hwAccel);
     } else {
       // Standard processing without crossfade
       await new Promise(async (resolve, reject) => {
