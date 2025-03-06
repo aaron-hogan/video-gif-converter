@@ -542,6 +542,39 @@ function extractVideoId(url) {
 }
 
 /**
+ * Convert seconds to YouTube time format (3m0s)
+ * @param {number} seconds - Time in seconds
+ * @returns {string} - Formatted time string
+ */
+function formatYouTubeTime(seconds) {
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return `${minutes}m${remainingSeconds}s`;
+}
+
+/**
+ * Add timestamp to YouTube URL to start at a specific time
+ * @param {string} url - YouTube URL
+ * @param {number} seconds - Start time in seconds
+ * @returns {string} - URL with timestamp
+ */
+function addTimestampToUrl(url, seconds) {
+  try {
+    // Parse the URL
+    const parsedUrl = new URL(url);
+    
+    // Set the timestamp parameter
+    parsedUrl.searchParams.set('t', formatYouTubeTime(seconds));
+    
+    return parsedUrl.toString();
+  } catch (e) {
+    // If URL parsing fails, append the timestamp directly
+    const separator = url.includes('?') ? '&' : '?';
+    return `${url}${separator}t=${formatYouTubeTime(seconds)}`;
+  }
+}
+
+/**
  * Check if memory usage exceeds the limit
  * @returns {boolean} True if memory limit is exceeded, false otherwise
  */
@@ -573,6 +606,7 @@ function logMemoryUsage() {
 
 /**
  * Download a segment of a YouTube video based on start time and duration
+ * This implementation downloads the entire video and then extracts the segment
  * @param {string} videoId - YouTube video ID
  * @param {object} videoInfo - Video info from ytdl.getInfo
  * @param {number} startTime - Start time in seconds
@@ -592,7 +626,12 @@ async function downloadVideoSegment(videoId, videoInfo, startTime, duration, out
         return resolve(outputPath);
       }
       
-      console.log(`Downloading segment from ${startTime}s to ${startTime + duration}s...`);
+      // Output appropriate message for seeking vs. starting at 0
+      if (startTime > 0) {
+        console.log(`Downloading segment from ${startTime}s to ${startTime + duration}s...`);
+      } else {
+        console.log(`Downloading segment of ${duration}s duration...`);
+      }
       
       // Select format based on quality preference
       let formats = videoInfo.formats.filter(format => format.hasVideo);
@@ -660,183 +699,152 @@ async function downloadVideoSegment(videoId, videoInfo, startTime, duration, out
         }
       }
       
-      // Check format codec/container 
-      const formatInfo = selectedFormat.mimeType || '';
-      const isVP9 = formatInfo.includes('vp9') || formatInfo.includes('webm');
-      const needsTranscode = isVP9 || !formatInfo.includes('mp4');
+      // Generate temporary file paths
+      const tempFullVideoPath = `${outputPath}.full.mp4`;
       
-      if (options.verbose) {
-        console.log(`Format info: ${formatInfo}`);
-        if (needsTranscode) {
-          console.log('Format requires transcoding for optimal compatibility');
-        }
-      }
+      // Download the full video or a larger segment
+      console.log(`Downloading full or partial video...`);
       
-      // Generate a temporary file path for downloading
-      const tempDownloadPath = `${outputPath}.download.mp4`;
+      // Create a video stream
+      const videoStream = ytdl.downloadFromInfo(videoInfo, { format: selectedFormat });
+      const writeStream = fs.createWriteStream(tempFullVideoPath);
       
-      if (options.verbose) {
-        console.log(`Using format URL: ${selectedFormat.url.substring(0, 100)}...`);
-      }
+      videoStream.pipe(writeStream);
       
-      // Create the FFmpeg command
-      const command = ffmpeg(selectedFormat.url)
-        .seekInput(startTime)
-        .duration(duration);
+      videoStream.on('error', (streamErr) => {
+        console.error('Error downloading video stream:', streamErr.message);
+        reject(streamErr);
+      });
       
-      // If the format is not mp4 or needs transcoding, transcode to h264 instead of copy
-      if (needsTranscode) {
-        command.outputOptions([
-          // Transcode to h264 for better compatibility
-          '-c:v', 'h264',
-          // Use reasonable quality setting
-          '-crf', '23',
-          // Fast encoding preset
-          '-preset', 'fast'
-        ]);
-      } else {
-        // Just copy the stream if it's already in a compatible format
-        command.outputOptions(['-c:v', 'copy']);
-      }
-      
-      command.output(tempDownloadPath);
+      writeStream.on('finish', () => {
+        console.log('Video download complete. Extracting segment...');
         
-      // Apply threading if specified
-      if (options.threads > 0) {
-        command.outputOptions([`-threads ${options.threads}`]);
-      } else if (options.threads === 0) {
-        const cpuCount = os.cpus().length;
-        command.outputOptions([`-threads ${cpuCount}`]);
-      }
-      
-      command.on('start', (commandLine) => {
-        if (options.verbose) {
-          console.log('FFmpeg segment download command:', commandLine);
-        }
-      })
-      .on('progress', (progress) => {
-        if (options.verbose && progress.percent) {
-          console.log(`Downloading segment: ${Math.floor(progress.percent)}% done`);
-        }
-      })
-      .on('end', () => {
-        console.log('Segment download complete');
+        // Use FFmpeg to extract the segment from the full video
+        const threadOpt = options.threads > 0 ? 
+          ['-threads', String(options.threads)] : 
+          (options.threads === 0 ? ['-threads', String(os.cpus().length)] : []);
         
-        // Verify the file exists and is not empty
-        if (!fs.existsSync(tempDownloadPath) || fs.statSync(tempDownloadPath).size === 0) {
-          console.error('Error: Downloaded segment is empty or does not exist');
-          return reject(new Error('Downloaded segment is empty or does not exist'));
-        }
-        
-        // Move the downloaded file to the final output path
-        fs.renameSync(tempDownloadPath, outputPath);
-        
-        // Save segment to cache if caching is enabled
-        if (options.cache) {
-          saveCachedSegment(videoId, startTime, duration, outputPath);
-        }
-        
-        resolve(outputPath);
-      })
-      .on('error', (err) => {
-        console.error('Error downloading segment with FFmpeg:', err.message);
-        
-        // Fall back to direct ytdl download
-        console.log('Falling back to full video download method...');
-        
-        // Create a stream from the format
-        const videoStream = ytdl.downloadFromInfo(videoInfo, { format: selectedFormat });
-        const writeStream = fs.createWriteStream(tempDownloadPath);
-        
-        videoStream.pipe(writeStream);
-        
-        videoStream.on('error', (streamErr) => {
-          console.error('Error downloading video stream:', streamErr.message);
-          reject(streamErr);
-        });
-        
-        writeStream.on('finish', () => {
-          console.log('Full video download complete. Extracting segment...');
-          
-          // Create a temporary file for the extracted segment
-          const tempSegmentPath = `${outputPath}.segment.mp4`;
-          
-          // Use FFmpeg to extract the segment from the full video
-          // Always transcode to ensure compatibility
-          ffmpeg(tempDownloadPath)
-            .seekInput(startTime)
-            .duration(duration)
-            .outputOptions([
-              // Transcode to h264 for compatibility
-              '-c:v', 'h264',
-              '-crf', '23',
-              '-preset', 'fast'
-            ])
-            .output(tempSegmentPath)
-            .on('end', () => {
-              // Clean up the original download
-              try {
-                fs.unlinkSync(tempDownloadPath);
-              } catch (e) {
-                // Ignore cleanup errors
-              }
+        ffmpeg(tempFullVideoPath)
+          .seekInput(startTime)
+          .duration(duration)
+          .outputOptions([
+            // Copy streams without re-encoding if possible
+            '-c:v', 'copy',
+            '-c:a', 'copy',
+            ...threadOpt
+          ])
+          .output(outputPath)
+          .on('start', (commandLine) => {
+            if (options.verbose) {
+              console.log('FFmpeg extract command:', commandLine);
+            }
+          })
+          .on('end', () => {
+            console.log('Segment extraction complete');
+            
+            // Clean up temp files
+            try {
+              fs.unlinkSync(tempFullVideoPath);
+            } catch (e) {
+              // Ignore cleanup errors
+            }
+            
+            // Verify output file
+            if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+              console.error('Error: Extracted segment is empty or missing');
               
-              // Move the segment to the output path
-              fs.renameSync(tempSegmentPath, outputPath);
+              // Try one more time with transcoding instead of copy
+              console.log('Retrying extraction with transcoding...');
               
-              console.log('Segment extraction and transcoding complete');
-              
-              // Save segment to cache
-              if (options.cache) {
-                saveCachedSegment(videoId, startTime, duration, outputPath);
-              }
-              
-              resolve(outputPath);
-            })
-            .on('error', (extractErr) => {
-              console.error('Error extracting segment:', extractErr.message);
-              
-              // As a last resort, try simpler extraction with copy
-              console.log('Trying simpler extraction as final fallback...');
-              
-              ffmpeg(tempDownloadPath)
+              ffmpeg(tempFullVideoPath)
                 .seekInput(startTime)
                 .duration(duration)
-                .outputOptions(['-c:v', 'copy'])
-                .output(tempSegmentPath)
+                .outputOptions([
+                  '-c:v', 'h264',
+                  '-crf', '23',
+                  '-preset', 'fast',
+                  ...threadOpt
+                ])
+                .output(outputPath)
                 .on('end', () => {
+                  console.log('Transcoded segment extraction complete');
+                  
                   try {
-                    fs.unlinkSync(tempDownloadPath);
+                    if (fs.existsSync(tempFullVideoPath)) {
+                      fs.unlinkSync(tempFullVideoPath);
+                    }
                   } catch (e) {
                     // Ignore cleanup errors
                   }
                   
-                  fs.renameSync(tempSegmentPath, outputPath);
-                  console.log('Simple segment extraction complete');
-                  
+                  // Save to cache
                   if (options.cache) {
                     saveCachedSegment(videoId, startTime, duration, outputPath);
                   }
                   
                   resolve(outputPath);
                 })
-                .on('error', (finalErr) => {
-                  console.error('All extraction methods failed:', finalErr.message);
-                  // Still resolve with the full video if all extraction fails
-                  fs.renameSync(tempDownloadPath, outputPath);
-                  resolve(outputPath);
+                .on('error', (transErr) => {
+                  console.error('Transcoded extraction failed:', transErr.message);
+                  reject(transErr);
                 })
                 .run();
-            })
-            .run();
-        });
-        
-        writeStream.on('error', (fileErr) => {
-          console.error('Error writing video file:', fileErr.message);
-          reject(fileErr);
-        });
-      })
-      .run();
+            } else {
+              // Save to cache
+              if (options.cache) {
+                saveCachedSegment(videoId, startTime, duration, outputPath);
+              }
+              
+              resolve(outputPath);
+            }
+          })
+          .on('error', (extractErr) => {
+            console.error('Error extracting segment:', extractErr.message);
+            
+            // Try one more time with transcoding instead of copy
+            console.log('Retrying extraction with transcoding...');
+            
+            ffmpeg(tempFullVideoPath)
+              .seekInput(startTime)
+              .duration(duration)
+              .outputOptions([
+                '-c:v', 'h264',
+                '-crf', '23',
+                '-preset', 'fast',
+                ...threadOpt
+              ])
+              .output(outputPath)
+              .on('end', () => {
+                console.log('Transcoded segment extraction complete');
+                
+                try {
+                  if (fs.existsSync(tempFullVideoPath)) {
+                    fs.unlinkSync(tempFullVideoPath);
+                  }
+                } catch (e) {
+                  // Ignore cleanup errors
+                }
+                
+                // Save to cache
+                if (options.cache) {
+                  saveCachedSegment(videoId, startTime, duration, outputPath);
+                }
+                
+                resolve(outputPath);
+              })
+              .on('error', (transErr) => {
+                console.error('Transcoded extraction failed:', transErr.message);
+                reject(transErr);
+              })
+              .run();
+          })
+          .run();
+      });
+      
+      writeStream.on('error', (fileErr) => {
+        console.error('Error writing video file:', fileErr.message);
+        reject(fileErr);
+      });
       
     } catch (err) {
       console.error('Error in downloadVideoSegment:', err.message);
@@ -853,7 +861,7 @@ function isCrossfadeEnabled() {
 // Function to check if hardware acceleration is available
 async function detectHardwareAcceleration() {
   return new Promise((resolve) => {
-    // Default hardware acceleration options
+    // Always return no hardware acceleration for troubleshooting
     const hwAccel = {
       available: false,
       type: null,
@@ -861,91 +869,8 @@ async function detectHardwareAcceleration() {
       options: []
     };
     
-    try {
-      // Check for platform-specific hardware acceleration
-      const platform = os.platform();
-      if (platform === 'darwin') {
-        // macOS - check for videotoolbox
-        require('child_process').exec('ffmpeg -hwaccels', (error, stdout) => {
-          if (!error && stdout.includes('videotoolbox')) {
-            hwAccel.available = true;
-            hwAccel.type = 'videotoolbox';
-            hwAccel.options = ['-hwaccel', 'videotoolbox'];
-            if (options.verbose) {
-              console.log('Detected macOS VideoToolbox hardware acceleration');
-            }
-          }
-          resolve(hwAccel);
-        });
-      } else if (platform === 'win32') {
-        // Windows - check for multiple options
-        require('child_process').exec('ffmpeg -hwaccels', (error, stdout) => {
-          if (!error) {
-            if (stdout.includes('dxva2')) {
-              hwAccel.available = true;
-              hwAccel.type = 'dxva2';
-              hwAccel.options = ['-hwaccel', 'dxva2'];
-              if (options.verbose) {
-                console.log('Detected Windows DXVA2 hardware acceleration');
-              }
-            } else if (stdout.includes('cuda') || stdout.includes('nvenc')) {
-              hwAccel.available = true;
-              hwAccel.type = 'cuda';
-              hwAccel.options = ['-hwaccel', 'cuda'];
-              if (options.verbose) {
-                console.log('Detected NVIDIA CUDA hardware acceleration');
-              }
-            } else if (stdout.includes('qsv')) {
-              hwAccel.available = true;
-              hwAccel.type = 'qsv';
-              hwAccel.options = ['-hwaccel', 'qsv'];
-              if (options.verbose) {
-                console.log('Detected Intel QuickSync hardware acceleration');
-              }
-            } else if (stdout.includes('d3d11va')) {
-              hwAccel.available = true;
-              hwAccel.type = 'd3d11va';
-              hwAccel.options = ['-hwaccel', 'd3d11va'];
-              if (options.verbose) {
-                console.log('Detected D3D11VA hardware acceleration');
-              }
-            }
-          }
-          resolve(hwAccel);
-        });
-      } else if (platform === 'linux') {
-        // Linux - check for multiple options
-        require('child_process').exec('ffmpeg -hwaccels', (error, stdout) => {
-          if (!error) {
-            if (stdout.includes('vaapi')) {
-              hwAccel.available = true;
-              hwAccel.type = 'vaapi';
-              hwAccel.options = ['-hwaccel', 'vaapi', '-vaapi_device', '/dev/dri/renderD128'];
-              if (options.verbose) {
-                console.log('Detected Linux VAAPI hardware acceleration');
-              }
-            } else if (stdout.includes('cuda') || stdout.includes('nvenc')) {
-              hwAccel.available = true;
-              hwAccel.type = 'cuda';
-              hwAccel.options = ['-hwaccel', 'cuda'];
-              if (options.verbose) {
-                console.log('Detected NVIDIA CUDA hardware acceleration');
-              }
-            }
-          }
-          resolve(hwAccel);
-        });
-      } else {
-        // Unknown platform or no acceleration
-        resolve(hwAccel);
-      }
-    } catch (err) {
-      // If detection fails, just proceed without hardware acceleration
-      if (options.verbose) {
-        console.warn('Hardware acceleration detection failed:', err.message);
-      }
-      resolve(hwAccel);
-    }
+    console.log('Hardware acceleration disabled for troubleshooting');
+    resolve(hwAccel);
   });
 }
 
@@ -962,13 +887,8 @@ if (options.url && options.input) {
 }
 
 /**
- * Function to create a crossfade effect for perfectly looping GIFs.
- * 
- * This implementation follows these principles:
- * 1. The base clip starts at (start_time + crossfade_duration) and plays for (total_duration - crossfade_duration)
- * 2. The crossfade clip contains the first (crossfade_duration) seconds of video from start_time
- * 3. When the base clip ends, it transitions smoothly into the crossfade clip
- * 4. This creates a seamless loop where the end blends perfectly into the beginning
+ * Function to create a crossfade effect for perfectly looping GIFs using a simplified approach
+ * that should work regardless of how the video was downloaded or what position we're seeking to.
  *
  * @param {string} videoPath - Path to the source video
  * @param {string} tempDir - Temporary directory for processing files
@@ -981,9 +901,6 @@ async function processCrossfade(videoPath, tempDir, outputPath, hwAccel = { avai
   try {
     console.log('Creating crossfade effect directly...');
     
-    // Generate palette for better quality
-    const palettePath = path.join(tempDir, 'palette.png');
-    
     // Create a temporary video with crossfade
     const tempVideoPath = path.join(tempDir, 'crossfade_video.mp4');
     
@@ -995,29 +912,30 @@ async function processCrossfade(videoPath, tempDir, outputPath, hwAccel = { avai
     // Parse durations and calculate timing
     const totalDuration = parseFloat(options.duration);
     const crossfadeDuration = options.crossfade;
-    const startTime = parseFloat(options.start);
-    const mainDuration = totalDuration - crossfadeDuration;
     
-    // Offset where the base clip starts - after the crossfade duration
-    const baseOffset = crossfadeDuration;
-    
+    // For simplicity's sake, we'll just extract the whole segment once and create the crossfade
+    // using that segment, rather than trying to calculate offsets into the original video
     return new Promise((resolve, reject) => {
-      // Create a complex filter to generate a perfect crossfade
+      // Create a filter that makes the end of the clip fade into the beginning
+      // to create a perfect loop
       let complexFilter = [
-        // Main section (starts after crossfade duration)
-        `[0:v]trim=start=${startTime + baseOffset}:duration=${mainDuration},setpts=PTS-STARTPTS[main]`,
+        // Split the video into parts we'll need
+        '[0:v]split=3[begin][middle][end]',
         
-        // End segment with fade out
-        `[0:v]trim=start=${startTime + mainDuration + baseOffset}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,format=yuva420p,fade=t=out:st=0:d=${crossfadeDuration}:alpha=1[fout]`,
+        // Extract the main portion from after the initial crossfade duration to before the end
+        '[middle]trim=start=' + crossfadeDuration + ':end=' + (totalDuration - crossfadeDuration) + ',setpts=PTS-STARTPTS[main]',
         
-        // Beginning segment with fade in (from the original start time)
-        `[0:v]trim=start=${startTime}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,format=yuva420p,fade=t=in:st=0:d=${crossfadeDuration}:alpha=1[fin]`,
+        // Extract the beginning portion for the end transition
+        '[begin]trim=start=0:end=' + crossfadeDuration + ',setpts=PTS-STARTPTS,format=yuva420p,fade=t=in:st=0:d=' + crossfadeDuration + ':alpha=1[fadein]',
         
-        // Overlay the fading segments to create transition
-        `[fin][fout]overlay[crossfade]`,
+        // Extract the end portion with fade out
+        '[end]trim=start=' + (totalDuration - crossfadeDuration) + ':end=' + totalDuration + ',setpts=PTS-STARTPTS,format=yuva420p,fade=t=out:st=0:d=' + crossfadeDuration + ':alpha=1[fadeout]',
         
-        // Join the main part with the crossfade section
-        `[main][crossfade]concat=n=2:v=1:a=0`
+        // Overlay the beginning (fadein) over the end (fadeout) to create the loop transition
+        '[fadeout][fadein]overlay[transition]',
+        
+        // Concatenate the main part with the transition to create the final looping video
+        '[main][transition]concat=n=2:v=1:a=0'
       ].join(';');
       
       /* 
@@ -1516,12 +1434,18 @@ async function run() {
       const startTime = parseFloat(options.start);
       const duration = parseFloat(options.duration);
       
+      // Note: We've found that the YouTube timestamp feature doesn't work reliably with ytdl-core
+      // So we'll keep the original seeking logic for now
+      if (options.verbose && startTime > 0) {
+        console.log(`Using seek time of ${startTime}s for video processing`);
+      }
+      
       // Download only the segment we need instead of the full video
       try {
         videoPath = await downloadVideoSegment(
           videoId,
           videoInfo,
-          startTime,
+          parseFloat(options.start), // This will now be 0 if we're using a URL timestamp
           // Add a small buffer to ensure we have enough video
           duration + (isCrossfadeEnabled() ? options.crossfade : 0) + 0.5, 
           videoPath,
@@ -1660,7 +1584,8 @@ async function run() {
         // Optimized single-pass approach using complex filtergraph for palette generation and application
         let ffmpegCommand = ffmpeg(processedVideoPath)
           .setStartTime(options.start)
-          .duration(options.duration);
+          .duration(options.duration)
+          .inputOption('-v', 'verbose'); // Add verbose debug output
           
         // Apply hardware acceleration if available
         if (hwAccel.available) {
@@ -1740,6 +1665,8 @@ async function run() {
             resolve();
           })
           .on('error', (err) => {
+            console.error('ERROR DETAILS:');
+            console.error(err);
             console.error('Error during conversion:', err.message);
             
             // Try an alternative method with a two-pass approach
@@ -1861,34 +1788,60 @@ async function run() {
                     // Fall back to the basic method
                     console.log('Using basic conversion as fallback...');
                     
-                    let fallbackFfmpeg = ffmpeg(processedVideoPath)
-                      .setStartTime(options.start);
-                    
-                    // Original fallback approach
-                    fallbackFfmpeg
-                      .duration(options.duration)
-                      .outputOptions([
-                        '-vf', `fps=${options.fps},scale=${options.width}:-1:flags=lanczos`,
-                        '-loop', options.loops
-                      ])
-                      .format('gif')
-                      .output(outputPath);
-                    
-                    fallbackFfmpeg.on('end', async () => {
-                      // Apply post-processing with gifsicle for better compression
+                    // Try a direct command approach as a last resort
+                    console.log('Using direct FFmpeg command as final fallback...');
+                    try {
+                      // Use child_process.exec to run a direct ffmpeg command
+                      const { execSync } = require('child_process');
+                      const directCmd = `ffmpeg -y -ss ${options.start} -t ${options.duration} -i "${processedVideoPath}" -vf "fps=${options.fps},scale=${options.width}:-1:flags=lanczos" -loop ${options.loops} "${outputPath}"`;
+                      console.log('Executing: ' + directCmd);
+                      execSync(directCmd, { stdio: 'inherit' });
+                      console.log('Direct FFmpeg command succeeded!');
+
+                      // Try to run postProcessGif
+                      (async () => {
+                        try {
+                          await postProcessGif(outputPath, options);
+                        } catch (err) {
+                          console.error('Error in post-processing:', err);
+                        }
+                        console.log(`Success with direct command! GIF saved to: ${path.resolve(outputPath)}`);
+                        resolve();
+                      })();
+                      return;
+                    } catch (directErr) {
+                      console.error('Direct FFmpeg command failed:', directErr);
+                      
+                      // Try a more basic approach with one final attempt
+                      console.log('Trying a different approach with palette...');
+                      
                       try {
-                        await postProcessGif(outputPath, options);
-                      } catch (err) {
-                        console.error('Error during post-processing:', err.message);
+                        const { execSync } = require('child_process');
+                        
+                        // Use single-pass approach with split filter to generate palette and use it
+                        // Put the seek before input for faster seeking
+                        const singlePassCmd = `ffmpeg -y -ss ${options.start} -t ${options.duration} -i "${processedVideoPath}" -vf "fps=${options.fps},scale=${options.width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -loop ${options.loops} "${outputPath}"`;
+                        console.log('Creating GIF with single-pass approach: ' + singlePassCmd);
+                        execSync(singlePassCmd, { stdio: 'inherit' });
+                        console.log('Palette method succeeded!');
+                        
+                        // Apply post-processing
+                        (async () => {
+                          try {
+                            await postProcessGif(outputPath, options);
+                          } catch (err) {
+                            console.error('Error in post-processing:', err);
+                          }
+                          console.log(`Success with palette method! GIF saved to: ${path.resolve(outputPath)}`);
+                          resolve();
+                        })();
+                        return;
+                      } catch (paletteErr) {
+                        console.error('Palette method failed:', paletteErr);
+                        console.warn('All conversion methods failed. Unable to create GIF.');
+                        reject(new Error('All conversion methods failed'));
                       }
-                      console.log(`Success with fallback method! GIF saved to: ${path.resolve(outputPath)}`);
-                      resolve();
-                    })
-                    .on('error', (fallbackErr) => {
-                      console.error('All conversion methods failed:', fallbackErr.message);
-                      reject(fallbackErr);
-                    })
-                    .run();
+                    }
                   })
                   .run();
               })
