@@ -222,43 +222,36 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
             throw err;
           }
           
-          // First generate the palette
+          // Optimized single-pass approach for crossfade GIF
+          console.log('Creating optimized GIF with single-pass filtergraph...');
+          
+          // Use a single complex filtergraph for palette generation and application
           ffmpeg(tempVideoPath)
-            .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen=stats_mode=diff:max_colors=${options.colors}`)
-            .output(palettePath)
-            .on('end', () => {
-              console.log('Palette generated, creating final GIF...');
-              
-              // Use the palette to create the final GIF
-              ffmpeg(tempVideoPath)
-                .input(palettePath)
-                .complexFilter([
-                  `fps=${options.fps},scale=${options.width}:-1:flags=lanczos [x]`,
-                  `[x][1:v] paletteuse=dither=${options.dither}`
-                ])
-                .outputOption('-loop', options.loops)
-                .format('gif')
-                .save(outputPath) // Use save() instead of output().run()
-                .on('end', async () => {
-                  // Apply post-processing with gifsicle for better compression
-                  try {
-                    await postProcessGif(outputPath, options);
-                  } catch (err) {
-                    console.error('Error during post-processing:', err.message);
-                  }
-                  console.log(`Success! GIF with crossfade saved to: ${path.resolve(outputPath)}`);
-                  resolve();
-                })
-                .on('error', (err) => {
-                  console.error('Error creating final GIF:', err.message);
-                  reject(err);
-                });
+            .complexFilter([
+              // Set FPS and scale the video
+              `fps=${options.fps},scale=${options.width}:-1:flags=lanczos,split[s0][s1]`,
+              // Generate the palette from the scaled video
+              `[s0]palettegen=stats_mode=diff:max_colors=${options.colors}[palette]`,
+              // Apply the palette to the scaled video
+              `[s1][palette]paletteuse=dither=${options.dither}`
+            ])
+            .outputOption('-loop', options.loops)
+            .format('gif')
+            .save(outputPath) // Use save() instead of output().run()
+            .on('end', async () => {
+              // Apply post-processing with gifsicle for better compression
+              try {
+                await postProcessGif(outputPath, options);
+              } catch (err) {
+                console.error('Error during post-processing:', err.message);
+              }
+              console.log(`Success! GIF with crossfade saved to: ${path.resolve(outputPath)}`);
+              resolve();
             })
             .on('error', (err) => {
-              console.error('Error generating palette:', err.message);
+              console.error('Error creating final GIF:', err.message);
               reject(err);
-            })
-            .run();
+            });
         })
         .on('error', (err) => {
           console.error('Error creating crossfade video:', err.message);
@@ -650,23 +643,25 @@ async function run() {
         // Generate a palette for better quality
         const palettePath = path.join(tempDir, 'palette.png');
         
-        // First pass - generate palette with tweaked settings for better performance
+        // Optimized single-pass approach using complex filtergraph for palette generation and application
         let ffmpegCommand = ffmpeg(processedVideoPath)
-          .setStartTime(options.start);
+          .setStartTime(options.start)
+          .duration(options.duration);
           
-        // Regular approach
-          ffmpegCommand
-            .duration(options.duration)
-            .videoFilters([
-              `fps=${options.fps}`,
-              `scale=${options.width}:-1:flags=lanczos`,
-              'split[s0][s1]',
-              `[s0]palettegen=stats_mode=diff:max_colors=${options.colors}[p]`,
-              `[s1][p]paletteuse=dither=${options.dither === 'bayer' ? 'bayer:bayer_scale=5' : options.dither}:diff_mode=rectangle`
-            ])
-            .outputOption('-loop', options.loops)
-            .format('gif')
-            .output(outputPath);
+        // Use a single complex filtergraph that generates a palette and applies it in one step
+        // This eliminates the need for temporary palette files and multiple passes
+        ffmpegCommand
+          .complexFilter([
+            // Set FPS and scale the video
+            `fps=${options.fps},scale=${options.width}:-1:flags=lanczos,split[s0][s1]`,
+            // Generate the palette from the scaled video
+            `[s0]palettegen=stats_mode=diff:max_colors=${options.colors}[palette]`,
+            // Apply the palette to the scaled video
+            `[s1][palette]paletteuse=dither=${options.dither === 'bayer' ? 'bayer:bayer_scale=5' : options.dither}:diff_mode=rectangle`
+          ])
+          .outputOption('-loop', options.loops)
+          .format('gif')
+          .output(outputPath);
         
         ffmpegCommand.on('start', (commandLine) => {
           if (options.verbose) {
