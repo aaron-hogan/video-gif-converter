@@ -230,9 +230,10 @@ if (options.url && options.input) {
  * @param {string} tempDir - Temporary directory for processing files
  * @param {string} outputPath - Path where the final GIF will be saved
  * @param {object} hwAccel - Hardware acceleration object with detection results
+ * @param {function} cleanupCallback - Optional callback function for cleaning up temp files
  * @returns {Promise} - Resolves when GIF is created
  */
-async function processCrossfade(videoPath, tempDir, outputPath, hwAccel = { available: false }) {
+async function processCrossfade(videoPath, tempDir, outputPath, hwAccel = { available: false }, cleanupCallback = null) {
   try {
     console.log('Creating crossfade effect directly...');
     
@@ -355,7 +356,9 @@ async function processCrossfade(videoPath, tempDir, outputPath, hwAccel = { avai
             .save(outputPath) // Use save() instead of output().run()
             .on('end', async () => {
               // Clean up the temporary crossfade video immediately
-              cleanupTempFile(tempVideoPath);
+              if (cleanupCallback) {
+                cleanupCallback(tempVideoPath);
+              }
               
               // Apply post-processing with gifsicle for better compression
               try {
@@ -794,8 +797,8 @@ async function run() {
         process.exit(1);
       }
       
-      // Process with crossfade effect - pass the hardware acceleration object
-      await processCrossfade(processedVideoPath, tempDir, outputPath, hwAccel);
+      // Process with crossfade effect - pass the hardware acceleration object and cleanup function
+      await processCrossfade(processedVideoPath, tempDir, outputPath, hwAccel, cleanupTempFile);
     } else {
       // Standard processing without crossfade
       await new Promise(async (resolve, reject) => {
