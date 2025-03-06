@@ -51,9 +51,9 @@ program
   .option('-i, --input <filepath>', 'Local video file path')
   .option('-s, --start <seconds>', 'Start time in seconds', '0')
   .option('-d, --duration <seconds>', 'Duration in seconds', '5')
-  .option('-o, --output <filename>', 'Output filename', 'output.gif')
+  .option('-o, --output <filename>', 'Output filename (defaults to input filename with .gif extension)')
   .option('-w, --width <pixels>', 'Width of the GIF in pixels', '480')
-  .option('-f, --fps <fps>', 'Frames per second', '15')
+  .option('-f, --fps <fps>', 'Frames per second', '30')
   .option('-l, --loops <count>', 'Number of loops (0 = infinite)', '0')
   .option('-v, --verbose', 'Enable verbose logging')
   .option('-m, --max-size <mb>', 'Maximum output file size in MB (constrains quality automatically)', '50')
@@ -214,17 +214,12 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
             fs.mkdirSync(outputDir, { recursive: true });
           }
           
-          // Check if file already exists and is writable
-          if (fs.existsSync(outputPath)) {
-            try {
-              fs.accessSync(outputPath, fs.constants.W_OK);
-              // Try to delete the existing file
-              fs.unlinkSync(outputPath);
-              console.log(`Removed existing file: ${outputPath}`);
-            } catch (err) {
-              console.error(`Error: Cannot overwrite existing file: ${outputPath}`);
-              throw err;
-            }
+          // Check that we have write access to the output directory
+          try {
+            fs.accessSync(outputDir, fs.constants.W_OK);
+          } catch (err) {
+            console.error(`Error: No write permission to output directory: ${outputDir}`);
+            throw err;
           }
           
           // First generate the palette
@@ -426,7 +421,61 @@ async function run() {
   try {
     // Create temp directory
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'youtube-gif-'));
-    const outputPath = options.output.endsWith('.gif') ? options.output : `${options.output}.gif`;
+    
+    // Function to find a non-conflicting filename
+    function getUniqueFilePath(basePath) {
+      if (!fs.existsSync(basePath)) {
+        return basePath;
+      }
+      
+      const ext = path.extname(basePath);
+      const baseWithoutExt = basePath.slice(0, -ext.length);
+      
+      let counter = 1;
+      let newPath;
+      
+      do {
+        newPath = `${baseWithoutExt}-${counter}${ext}`;
+        counter++;
+      } while (fs.existsSync(newPath));
+      
+      return newPath;
+    }
+    
+    // Determine output path based on input if not specified
+    let outputPath;
+    if (options.output) {
+      outputPath = options.output.endsWith('.gif') ? options.output : `${options.output}.gif`;
+    } else if (options.input) {
+      // Use input filename with .gif extension
+      const inputBasename = path.basename(options.input, path.extname(options.input));
+      const inputDir = path.dirname(options.input);
+      outputPath = path.join(inputDir, `${inputBasename}.gif`);
+    } else if (options.url) {
+      // For YouTube URLs without specified output, use the video ID (slug)
+      let videoId;
+      try {
+        // Extract the video ID from URL
+        const url = new URL(options.url);
+        if (url.hostname.includes('youtube.com')) {
+          videoId = url.searchParams.get('v');
+        } else if (url.hostname.includes('youtu.be')) {
+          videoId = url.pathname.substring(1);
+        }
+      } catch (e) {
+        // If URL parsing fails, fallback to regex
+        const regex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i;
+        const match = options.url.match(regex);
+        videoId = match ? match[1] : null;
+      }
+      
+      outputPath = videoId ? `youtube-${videoId}.gif` : `youtube-${Date.now()}.gif`;
+    } else {
+      outputPath = 'output.gif';
+    }
+    
+    // Ensure we don't overwrite existing files
+    outputPath = getUniqueFilePath(outputPath);
     
     // Handle YouTube video
     if (options.url) {
@@ -534,10 +583,6 @@ async function run() {
       fs.mkdirSync(outputDir, { recursive: true });
     }
     
-    // Apply speed preprocessing if needed
-    processedVideoPath = await preprocessVideoSpeed(videoPath, tempDir, options.speed);
-    // From this point on, use processedVideoPath instead of videoPath
-    
     // Check if we have write access to the output directory
     try {
       fs.accessSync(outputDir, fs.constants.W_OK);
@@ -546,18 +591,9 @@ async function run() {
       process.exit(1);
     }
     
-    // Check if file already exists and is writable
-    if (fs.existsSync(outputPath)) {
-      try {
-        fs.accessSync(outputPath, fs.constants.W_OK);
-        // Try to delete the existing file
-        fs.unlinkSync(outputPath);
-        console.log(`Removed existing file: ${outputPath}`);
-      } catch (err) {
-        console.error(`Error: Cannot overwrite existing file: ${outputPath}`);
-        process.exit(1);
-      }
-    }
+    // Apply speed preprocessing if needed
+    processedVideoPath = await preprocessVideoSpeed(videoPath, tempDir, options.speed);
+    // From this point on, use processedVideoPath instead of videoPath
     
     // Calculate file size estimate and warn for large files
     const estimatedFrames = parseInt(options.fps) * parseInt(options.duration);
