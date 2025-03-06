@@ -264,24 +264,60 @@ async function run() {
           return;
         }
         
-        // Now create the GIF with the seamless crossfade loop
-        ffmpegCommand = ffmpeg();
+        // Create a crossfade by using fade in/out filters
+        // This approach is more reliable and visible
         
-        // Input the same segment twice
+        // First, create two separate segments for start and end
+        const startSegPath = path.join(tempDir, 'start_seg.mp4');
+        const endSegPath = path.join(tempDir, 'end_seg.mp4');
+        
+        // Extract start segment (beginning of the clip)
+        await new Promise((resolveStart, rejectStart) => {
+          ffmpeg(loopSegmentPath)
+            .setStartTime(0)
+            .duration(crossfadeDuration)
+            .output(startSegPath)
+            .on('end', resolveStart)
+            .on('error', rejectStart)
+            .run();
+        });
+        
+        // Extract end segment (end of the clip)
+        await new Promise((resolveEnd, rejectEnd) => {
+          ffmpeg(loopSegmentPath)
+            .setStartTime(actualDuration - crossfadeDuration)
+            .duration(crossfadeDuration)
+            .output(endSegPath)
+            .on('end', resolveEnd)
+            .on('error', rejectEnd)
+            .run();
+        });
+        
+        // Now create the GIF with crossfade
+        ffmpegCommand = ffmpeg();
+        console.log('Using fade in/out for clearly visible crossfade...');
+        
+        // Input files - main clip and the start segment for looping
         ffmpegCommand
-          .input(loopSegmentPath)
-          .input(loopSegmentPath)
+          .input(loopSegmentPath) // Main clip
+          .input(startSegPath)    // Beginning for crossfade
           .complexFilter([
-            // Process the first segment
-            `[0:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos,trim=0:${actualDuration - crossfadeDuration/2}[first]`,
+            // Process main clip
+            `[0:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos[main]`,
             
-            // Process the second segment
-            `[1:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos,trim=0:${actualDuration}[second]`,
+            // Process start segment
+            `[1:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos[start]`,
             
-            // Create crossfade between the two segments
-            `[first][second]xfade=transition=fade:duration=${crossfadeDuration}:offset=${actualDuration - crossfadeDuration}[merged]`,
+            // Fade out the end of main clip
+            `[main]fade=t=out:st=${actualDuration - crossfadeDuration}:d=${crossfadeDuration}[faded_main]`,
             
-            // Generate palette from the merged result
+            // Fade in the start segment
+            `[start]fade=t=in:st=0:d=${crossfadeDuration}[faded_start]`,
+            
+            // Overlay the faded start segment onto the end of the main clip
+            `[faded_main][faded_start]overlay=shortest=1[merged]`,
+            
+            // Generate palette from the final result
             `[merged]split[s0][s1]`,
             `[s0]palettegen=stats_mode=diff[p]`,
             `[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle[out]`
