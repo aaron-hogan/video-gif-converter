@@ -77,17 +77,31 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
     const crossfadeDuration = options.crossfade;
     
     return new Promise((resolve, reject) => {
-      // First let's create the video with crossfade effect using a single command
-      // We'll extract the clip from the start and position it at the end for crossfade
+      // Using a true crossfade effect that will work with standard ffmpeg
+      const startTime = parseFloat(options.start);
+      
+      // We'll create three segments:
+      // 1. The main video without the end portion that will be crossfaded
+      // 2. The end portion of the main video that we'll fade out
+      // 3. The beginning portion that we'll fade in
+      // By overlaying the fadeout and fadein segments, we get a true crossfade
+      const mainDuration = totalDuration - crossfadeDuration;
+      
       const complexFilter = [
-        // Split the input into two streams
-        '[0:v]split[v1][v2]',
-        // First stream: take from start+crossfade for duration
-        `[v1]trim=start=${parseFloat(options.start) + crossfadeDuration}:duration=${totalDuration},setpts=PTS-STARTPTS[main]`,
-        // Second stream: take the crossfade portion from start
-        `[v2]trim=start=${parseFloat(options.start)}:duration=${crossfadeDuration},setpts=PTS-STARTPTS+${totalDuration - crossfadeDuration}/TB[xfade]`,
-        // Overlay the crossfade portion on top of the main video
-        '[main][xfade]overlay=shortest=1:x=0:y=0:eof_action=repeat'
+        // Extract the main clip up to the crossfade point
+        `[0:v]trim=start=${startTime}:duration=${mainDuration},setpts=PTS-STARTPTS[base]`,
+        
+        // Extract the ending segment and add a fade out
+        `[0:v]trim=start=${startTime + mainDuration}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,fade=t=out:st=0:d=${crossfadeDuration}[fadeout]`,
+        
+        // Extract the beginning segment and add a fade in
+        `[0:v]trim=start=${startTime}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,fade=t=in:st=0:d=${crossfadeDuration}[fadein]`,
+        
+        // Overlay the fadeout and fadein segments
+        '[fadeout][fadein]overlay[crossfade]',
+        
+        // Concatenate the base with the crossfade section
+        '[base][crossfade]concat=n=2:v=1:a=0'
       ].join(';');
       
       ffmpeg(videoPath)
