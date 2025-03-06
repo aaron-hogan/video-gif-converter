@@ -264,50 +264,59 @@ async function run() {
           return;
         }
         
-        // Let's use the most direct and reliable approach for a true crossfade
-        console.log('Creating a proper crossfade transition with concatenation...');
+        // We need to create a truly seamless loop by making the end of the video 
+        // crossfade directly into the beginning
+        console.log('Creating a seamless loop with perfect crossfade timing...');
         
-        // The crossfade duration
-        const fadeDuration = crossfadeDuration;
+        // For a seamless loop, we need to create a special sequence:
+        // 1. Start with the full clip
+        // 2. Extract a portion from the beginning (exactly crossfade length)
+        // 3. Create a crossfade between end of original clip and the beginning portion
+        // This creates a true loop with no jump cuts
         
-        // Calculate timing for a perfect loop
-        const mainDuration = actualDuration - fadeDuration; // Full duration minus the overlap
-        
-        // Create two temporary segments that will be combined
-        const firstSegPath = path.join(tempDir, 'first_segment.mp4');
-        const lastSegPath = path.join(tempDir, 'last_segment.mp4');
-        
-        // Extract the main portion (everything except the crossfade duration at the end)
-        await new Promise((resolveFirst, rejectFirst) => {
-          ffmpeg(loopSegmentPath)
-            .setStartTime(0)
-            .duration(mainDuration)
-            .output(firstSegPath)
-            .on('end', resolveFirst)
-            .on('error', rejectFirst)
-            .run();
-        });
-        
-        // Extract the beginning portion again (just the crossfade duration)
-        await new Promise((resolveLast, rejectLast) => {
-          ffmpeg(loopSegmentPath)
-            .setStartTime(0)
-            .duration(fadeDuration)
-            .output(lastSegPath)
-            .on('end', resolveLast)
-            .on('error', rejectLast)
-            .run();
-        });
-        
-        // Now create a crossfade between these segments using FFmpeg's dedicated xfade filter
+        // Prepare paths for temporary files
+        const fullClipPath = path.join(tempDir, 'full_clip.mp4');
+        const beginClipPath = path.join(tempDir, 'begin_clip.mp4');
         const crossfadedPath = path.join(tempDir, 'crossfaded.mp4');
+        
+        // Step 1: First trim the original clip to exactly the duration we want
+        await new Promise((resolveFullClip, rejectFullClip) => {
+          ffmpeg(loopSegmentPath)
+            .setStartTime(0)
+            .duration(actualDuration)
+            .outputOptions('-c copy') // Fast copy without re-encoding
+            .output(fullClipPath)
+            .on('end', resolveFullClip)
+            .on('error', rejectFullClip)
+            .run();
+        });
+        
+        // Step 2: Extract just the beginning portion for the loop (exactly crossfade length)
+        await new Promise((resolveBeginClip, rejectBeginClip) => {
+          ffmpeg(loopSegmentPath)
+            .setStartTime(0)
+            .duration(crossfadeDuration)
+            .outputOptions('-c copy') // Fast copy without re-encoding
+            .output(beginClipPath)
+            .on('end', resolveBeginClip)
+            .on('error', rejectBeginClip)
+            .run();
+        });
+        
+        // Step 3: Create a transition between the main clip and the beginning clip
+        // This is the key - we concatenate but leave a gap at the end for crossfade
         await new Promise((resolveCrossfade, rejectCrossfade) => {
           ffmpeg()
-            .input(firstSegPath)  // First part of the video
-            .input(lastSegPath)   // The beginning part that will be used for the loop
+            .input(fullClipPath)
+            .input(beginClipPath)
             .complexFilter([
-              // Use the xfade filter - simpler and reliable
-              `xfade=transition=fade:duration=${fadeDuration}:offset=${mainDuration-fadeDuration}`
+              // Scale the videos for consistency
+              `[0:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos[main]`,
+              `[1:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos[loop]`,
+              
+              // Use the special form of xfade with offset to create a proper loop point
+              // This is critical - the offset must be exactly (duration - crossfade)
+              `[main][loop]xfade=transition=fade:duration=${crossfadeDuration}:offset=${actualDuration-crossfadeDuration}`
             ])
             .outputOptions(['-pix_fmt', 'yuv420p'])
             .output(crossfadedPath)
