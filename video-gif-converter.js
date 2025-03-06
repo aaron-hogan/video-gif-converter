@@ -30,7 +30,6 @@ program
   .option('-w, --width <pixels>', 'Width of the GIF in pixels', '480')
   .option('-f, --fps <fps>', 'Frames per second', '15')
   .option('-l, --loops <count>', 'Number of loops (0 = infinite)', '0')
-  .option('-c, --crossfade <seconds>', 'Add crossfade effect between loop ends (in seconds)', '0')
   .option('-v, --verbose', 'Enable verbose logging')
   .option('-m, --max-size <mb>', 'Maximum output file size in MB (constrains quality automatically)', '50')
   .parse(process.argv);
@@ -225,115 +224,12 @@ async function run() {
       console.log('Generating palette for high-quality GIF...');
       console.log(`Settings: ${options.duration}s duration, ${options.width}px width, ${options.fps} FPS`);
       
-      // Check if crossfade is enabled
-      const crossfadeDuration = parseFloat(options.crossfade);
-      const hasCrossfade = crossfadeDuration > 0;
-      
-      if (hasCrossfade) {
-        console.log(`Applying ${crossfadeDuration}s crossfade between loop ends...`);
-      }
       
       // First pass - generate palette with tweaked settings for better performance
       let ffmpegCommand = ffmpeg(videoPath)
         .setStartTime(options.start);
         
-      if (hasCrossfade && parseFloat(options.duration) > crossfadeDuration * 2) {
-        // For crossfade, create a proper looping segment by duplicating the video
-        // and creating a smooth transition between copies
-        
-        const actualDuration = parseFloat(options.duration);
-        
-        // Create a temporary video file to hold our looping segment
-        const loopSegmentPath = path.join(tempDir, 'loop_segment.mp4');
-        
-        // First create our looping segment
-        try {
-          await new Promise((resolveSegment, rejectSegment) => {
-          // Extract the base segment first
-          ffmpeg(videoPath)
-            .setStartTime(options.start)
-            .duration(actualDuration)
-            .output(loopSegmentPath)
-            .on('end', resolveSegment)
-            .on('error', rejectSegment)
-            .run();
-          });
-        } catch (segmentError) {
-          console.error('Error creating loop segment:', segmentError.message);
-          reject(segmentError);
-          return;
-        }
-        
-        // For a truly seamless loop, we need a different approach - let's use the simplest
-        // solution that creates exactly what we need - a crossfade between the end and beginning
-        console.log('Creating a perfect loop using careful timing...');
-        
-        // The most reliable approach is to create two separate video clips 
-        // then combine them with a crossfade transition
-        
-        // Let's use a different approach - create a true crossfade directly in a single pass
-        console.log('Creating a crossfade directly with a single filter chain...');
-        
-        // Prepare a single output file
-        const crossfadedPath = path.join(tempDir, 'crossfaded.mp4');
-        
-        // Create a single command that does everything we need
-        await new Promise((resolveXfade, rejectXfade) => {
-          // Use a direct single-pass approach  
-          ffmpeg(loopSegmentPath)
-            .complexFilter([
-              // Set the frame rate and scale first
-              `fps=${options.fps},scale=${options.width}:-1:flags=lanczos[v0]`,
-              
-              // Split the video into two - one for each part of the crossfade
-              `[v0]split[front][back]`,
-              
-              // Take just the first few seconds for the front
-              `[front]trim=0:${crossfadeDuration},setpts=PTS-STARTPTS[v1]`,
-              
-              // Take most of the original video for the back part
-              `[back]trim=0:${actualDuration},setpts=PTS-STARTPTS[v2]`,
-              
-              // Apply a fade out to the main part
-              `[v2]fade=t=out:st=${actualDuration-crossfadeDuration}:d=${crossfadeDuration}[mainFaded]`,
-              
-              // Apply a fade in to the loop part (beginning)
-              `[v1]fade=t=in:st=0:d=${crossfadeDuration}[loopFaded]`,
-              
-              // Overlay the beginning onto the end to create crossfade
-              `[mainFaded][loopFaded]overlay=eof_action=repeat:repeatlast=1:enable='gte(t,${actualDuration-crossfadeDuration})'[v]`
-            ], '[v]')
-            .outputOptions('-pix_fmt yuv420p')
-            .output(crossfadedPath)
-            .on('end', resolveXfade)
-            .on('error', (err) => {
-              console.error('Filter chain error:', err.message);
-              rejectXfade(err);
-            })
-            .on('start', (cmd) => {
-              if (options.verbose) {
-                console.log('Running ffmpeg command:', cmd);
-              }
-            })
-            .run();
-        });
-        
-        // Now convert the crossfaded video to a GIF with optimized palette
-        ffmpegCommand = ffmpeg(crossfadedPath);
-        ffmpegCommand
-          .videoFilters([
-            // Standard GIF conversion with high quality
-            `fps=${options.fps}`,
-            `scale=${options.width}:-1:flags=lanczos`,
-            'split[s0][s1]',
-            '[s0]palettegen=stats_mode=diff:max_colors=256[p]',
-            '[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle'
-          ])
-          .outputOption('-loop', options.loops)
-          .format('gif')
-          .output(outputPath);
-      } else {
-        // Regular approach without crossfade
+      // Regular approach
         ffmpegCommand
           .duration(options.duration)
           .videoFilters([
@@ -346,7 +242,6 @@ async function run() {
           .outputOption('-loop', options.loops)
           .format('gif')
           .output(outputPath);
-      }
       
       ffmpegCommand.on('start', (commandLine) => {
         if (options.verbose) {
@@ -373,7 +268,6 @@ async function run() {
             .setStartTime(options.start);
             
           // For alternate approach, use a simpler palette generation
-          // regardless of crossfade (the actual crossfade will be handled in second pass)
           alternateFfmpeg
             .duration(parseFloat(options.duration))
             .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen=stats_mode=diff`)
@@ -393,21 +287,7 @@ async function run() {
               let fallbackFfmpeg = ffmpeg(videoPath)
                 .setStartTime(options.start);
               
-              // Apply crossfade in fallback mode if available
-              if (hasCrossfade && parseFloat(options.duration) > crossfadeDuration * 2) {
-                const actualDuration = parseFloat(options.duration);
-                
-                fallbackFfmpeg
-                  .duration(actualDuration)
-                  .complexFilter([
-                    // Basic crossfade setup - simplified for fallback
-                    `fps=${options.fps},scale=${options.width}:-1:flags=lanczos,tblend=all_mode=average:all_opacity=0.5`
-                  ])
-                  .outputOption('-loop', options.loops)
-                  .format('gif')
-                  .output(outputPath);
-              } else {
-                // Standard approach without crossfade
+              // Standard approach
                 fallbackFfmpeg
                   .duration(options.duration)
                   .outputOptions([
@@ -416,7 +296,6 @@ async function run() {
                   ])
                   .format('gif')
                   .output(outputPath);
-              }
               
               fallbackFfmpeg.on('start', (commandLine) => {
                 if (options.verbose) {
@@ -438,8 +317,7 @@ async function run() {
               let secondPassFfmpeg = ffmpeg(videoPath)
                 .setStartTime(options.start);
                 
-              {
-                // Standard two-pass approach without crossfade
+              // Standard two-pass approach
                 secondPassFfmpeg
                   .duration(options.duration)
                   .videoFilter([
@@ -453,7 +331,6 @@ async function run() {
                   .outputOption('-loop', options.loops)
                   .format('gif')
                   .output(outputPath);
-              }
               
               secondPassFfmpeg.on('start', (commandLine) => {
                 if (options.verbose) {
@@ -473,17 +350,15 @@ async function run() {
                   let fallbackFfmpeg = ffmpeg(videoPath)
                     .setStartTime(options.start);
                   
-                  {
-                    // Original fallback without crossfade
-                    fallbackFfmpeg
-                      .duration(options.duration)
-                      .outputOptions([
-                        '-vf', `fps=${options.fps},scale=${options.width}:-1:flags=lanczos`,
-                        '-loop', options.loops
-                      ])
-                      .format('gif')
-                      .output(outputPath);
-                  }
+                  // Original fallback approach
+                  fallbackFfmpeg
+                    .duration(options.duration)
+                    .outputOptions([
+                      '-vf', `fps=${options.fps},scale=${options.width}:-1:flags=lanczos`,
+                      '-loop', options.loops
+                    ])
+                    .format('gif')
+                    .output(outputPath);
                   
                   fallbackFfmpeg.on('end', () => {
                     console.log(`Success with fallback method! GIF saved to: ${path.resolve(outputPath)}`);
