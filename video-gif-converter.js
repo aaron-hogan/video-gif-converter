@@ -264,64 +264,57 @@ async function run() {
           return;
         }
         
-        // We need to create a truly seamless loop by making the end of the video 
-        // crossfade directly into the beginning
-        console.log('Creating a seamless loop with perfect crossfade timing...');
+        // For a truly seamless loop, we need a different approach - let's use the simplest
+        // solution that creates exactly what we need - a crossfade between the end and beginning
+        console.log('Creating a perfect loop using careful timing...');
         
-        // For a seamless loop, we need to create a special sequence:
-        // 1. Start with the full clip
-        // 2. Extract a portion from the beginning (exactly crossfade length)
-        // 3. Create a crossfade between end of original clip and the beginning portion
-        // This creates a true loop with no jump cuts
+        // The most reliable approach is to create two separate video clips 
+        // then combine them with a crossfade transition
         
-        // Prepare paths for temporary files
-        const fullClipPath = path.join(tempDir, 'full_clip.mp4');
-        const beginClipPath = path.join(tempDir, 'begin_clip.mp4');
+        // Let's use a different approach - create a true crossfade directly in a single pass
+        console.log('Creating a crossfade directly with a single filter chain...');
+        
+        // Prepare a single output file
         const crossfadedPath = path.join(tempDir, 'crossfaded.mp4');
         
-        // Step 1: First trim the original clip to exactly the duration we want
-        await new Promise((resolveFullClip, rejectFullClip) => {
+        // Create a single command that does everything we need
+        await new Promise((resolveXfade, rejectXfade) => {
+          // Use a direct single-pass approach  
           ffmpeg(loopSegmentPath)
-            .setStartTime(0)
-            .duration(actualDuration)
-            .outputOptions('-c copy') // Fast copy without re-encoding
-            .output(fullClipPath)
-            .on('end', resolveFullClip)
-            .on('error', rejectFullClip)
-            .run();
-        });
-        
-        // Step 2: Extract just the beginning portion for the loop (exactly crossfade length)
-        await new Promise((resolveBeginClip, rejectBeginClip) => {
-          ffmpeg(loopSegmentPath)
-            .setStartTime(0)
-            .duration(crossfadeDuration)
-            .outputOptions('-c copy') // Fast copy without re-encoding
-            .output(beginClipPath)
-            .on('end', resolveBeginClip)
-            .on('error', rejectBeginClip)
-            .run();
-        });
-        
-        // Step 3: Create a transition between the main clip and the beginning clip
-        // This is the key - we concatenate but leave a gap at the end for crossfade
-        await new Promise((resolveCrossfade, rejectCrossfade) => {
-          ffmpeg()
-            .input(fullClipPath)
-            .input(beginClipPath)
             .complexFilter([
-              // Scale the videos for consistency
-              `[0:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos[main]`,
-              `[1:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos[loop]`,
+              // Set the frame rate and scale first
+              `fps=${options.fps},scale=${options.width}:-1:flags=lanczos[v0]`,
               
-              // Use the special form of xfade with offset to create a proper loop point
-              // This is critical - the offset must be exactly (duration - crossfade)
-              `[main][loop]xfade=transition=fade:duration=${crossfadeDuration}:offset=${actualDuration-crossfadeDuration}`
-            ])
-            .outputOptions(['-pix_fmt', 'yuv420p'])
+              // Split the video into two - one for each part of the crossfade
+              `[v0]split[front][back]`,
+              
+              // Take just the first few seconds for the front
+              `[front]trim=0:${crossfadeDuration},setpts=PTS-STARTPTS[v1]`,
+              
+              // Take most of the original video for the back part
+              `[back]trim=0:${actualDuration},setpts=PTS-STARTPTS[v2]`,
+              
+              // Apply a fade out to the main part
+              `[v2]fade=t=out:st=${actualDuration-crossfadeDuration}:d=${crossfadeDuration}[mainFaded]`,
+              
+              // Apply a fade in to the loop part (beginning)
+              `[v1]fade=t=in:st=0:d=${crossfadeDuration}[loopFaded]`,
+              
+              // Overlay the beginning onto the end to create crossfade
+              `[mainFaded][loopFaded]overlay=eof_action=repeat:repeatlast=1:enable='gte(t,${actualDuration-crossfadeDuration})'[v]`
+            ], '[v]')
+            .outputOptions('-pix_fmt yuv420p')
             .output(crossfadedPath)
-            .on('end', resolveCrossfade)
-            .on('error', rejectCrossfade)
+            .on('end', resolveXfade)
+            .on('error', (err) => {
+              console.error('Filter chain error:', err.message);
+              rejectXfade(err);
+            })
+            .on('start', (cmd) => {
+              if (options.verbose) {
+                console.log('Running ffmpeg command:', cmd);
+              }
+            })
             .run();
         });
         
