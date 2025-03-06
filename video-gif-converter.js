@@ -32,9 +32,18 @@ program
   .option('-l, --loops <count>', 'Number of loops (0 = infinite)', '0')
   .option('-v, --verbose', 'Enable verbose logging')
   .option('-m, --max-size <mb>', 'Maximum output file size in MB (constrains quality automatically)', '50')
+  .option('-c, --crossfade <seconds>', 'Apply crossfade effect for looping, duration in seconds', '0')
   .parse(process.argv);
 
 const options = program.opts();
+
+// Convert crossfade option to float
+options.crossfade = parseFloat(options.crossfade);
+
+// Function to check if crossfade is enabled
+function isCrossfadeEnabled() {
+  return options.crossfade > 0;
+}
 
 // Validate that either URL or input file is provided
 if (!options.url && !options.input) {
@@ -46,6 +55,159 @@ if (!options.url && !options.input) {
 if (options.url && options.input) {
   console.error('Error: Please provide either a YouTube URL (-u, --url) OR a local file path (-i, --input), not both');
   process.exit(1);
+}
+
+/**
+ * Function to create a crossfade effect for perfectly looping GIFs.
+ * 
+ * This implementation follows these principles:
+ * 1. The base clip starts at (start_time + crossfade_duration) and plays for (total_duration - crossfade_duration)
+ * 2. The crossfade clip contains the first (crossfade_duration) seconds of video from start_time
+ * 3. When the base clip ends, it transitions smoothly into the crossfade clip
+ * 4. This creates a seamless loop where the end blends perfectly into the beginning
+ *
+ * @param {string} videoPath - Path to the source video
+ * @param {string} tempDir - Temporary directory for processing files
+ * @param {string} outputPath - Path where the final GIF will be saved
+ * @returns {Promise} - Resolves when GIF is created
+ */
+async function processCrossfade(videoPath, tempDir, outputPath) {
+  try {
+    console.log('Creating crossfade effect directly...');
+    
+    // Generate palette for better quality
+    const palettePath = path.join(tempDir, 'palette.png');
+    
+    // Create a temporary video with crossfade
+    const tempVideoPath = path.join(tempDir, 'crossfade_video.mp4');
+    
+    // Parse durations and calculate timing
+    const totalDuration = parseFloat(options.duration);
+    const crossfadeDuration = options.crossfade;
+    const startTime = parseFloat(options.start);
+    const mainDuration = totalDuration - crossfadeDuration;
+    
+    // Offset where the base clip starts - after the crossfade duration
+    const baseOffset = crossfadeDuration;
+    
+    return new Promise((resolve, reject) => {
+      // Create a complex filter to generate a perfect crossfade
+      let complexFilter = [
+        // Main section (starts after crossfade duration)
+        `[0:v]trim=start=${startTime + baseOffset}:duration=${mainDuration},setpts=PTS-STARTPTS[main]`,
+        
+        // End segment with fade out
+        `[0:v]trim=start=${startTime + mainDuration + baseOffset}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,format=yuva420p,fade=t=out:st=0:d=${crossfadeDuration}:alpha=1[fout]`,
+        
+        // Beginning segment with fade in (from the original start time)
+        `[0:v]trim=start=${startTime}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,format=yuva420p,fade=t=in:st=0:d=${crossfadeDuration}:alpha=1[fin]`,
+        
+        // Overlay the fading segments to create transition
+        `[fin][fout]overlay[crossfade]`,
+        
+        // Join the main part with the crossfade section
+        `[main][crossfade]concat=n=2:v=1:a=0`
+      ].join(';');
+      
+      /* 
+      // DEBUG VERSION with visual timecodes - uncomment if needed for troubleshooting
+      if (options.verbose) {
+        complexFilter = [
+          // Main section with RED timestamp
+          `[0:v]trim=start=${startTime + baseOffset}:duration=${mainDuration},setpts=PTS-STARTPTS,drawtext=text='MAIN %{pts\\:hms}':x=10:y=10:fontsize=36:fontcolor=red:box=1:boxcolor=black@0.5[main]`,
+          
+          // End segment with fade out
+          `[0:v]trim=start=${startTime + mainDuration + baseOffset}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,format=yuva420p,fade=t=out:st=0:d=${crossfadeDuration}:alpha=1[fout]`,
+          
+          // Beginning segment with BLUE timestamp in top-right
+          `[0:v]trim=start=${startTime}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,drawtext=text='START %{pts\\:hms}':x=w-280:y=10:fontsize=36:fontcolor=blue:box=1:boxcolor=white@0.5,format=yuva420p,fade=t=in:st=0:d=${crossfadeDuration}:alpha=1[fin]`,
+          
+          // Overlay the fading segments
+          `[fin][fout]overlay[crossfade]`,
+          
+          // Join the main part with the crossfade
+          `[main][crossfade]concat=n=2:v=1:a=0`
+        ].join(';');
+      }
+      */
+      
+      ffmpeg(videoPath)
+        .complexFilter(complexFilter)
+        .output(tempVideoPath)
+        .outputOptions(['-map', '0:a?']) // Include audio if present
+        .on('start', (commandLine) => {
+          if (options.verbose) {
+            console.log('FFmpeg command:', commandLine);
+          }
+        })
+        .on('end', () => {
+          console.log('Crossfade video created successfully');
+          
+          // Now convert the video to GIF using high-quality two-pass approach
+          console.log('Generating palette for high-quality GIF...');
+          
+          // Ensure output directory exists
+          const outputDir = path.dirname(path.resolve(outputPath));
+          if (!fs.existsSync(outputDir)) {
+            console.log(`Creating output directory: ${outputDir}`);
+            fs.mkdirSync(outputDir, { recursive: true });
+          }
+          
+          // Check if file already exists and is writable
+          if (fs.existsSync(outputPath)) {
+            try {
+              fs.accessSync(outputPath, fs.constants.W_OK);
+              // Try to delete the existing file
+              fs.unlinkSync(outputPath);
+              console.log(`Removed existing file: ${outputPath}`);
+            } catch (err) {
+              console.error(`Error: Cannot overwrite existing file: ${outputPath}`);
+              throw err;
+            }
+          }
+          
+          // First generate the palette
+          ffmpeg(tempVideoPath)
+            .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen=stats_mode=diff`)
+            .output(palettePath)
+            .on('end', () => {
+              console.log('Palette generated, creating final GIF...');
+              
+              // Use the palette to create the final GIF
+              ffmpeg(tempVideoPath)
+                .input(palettePath)
+                .complexFilter([
+                  `fps=${options.fps},scale=${options.width}:-1:flags=lanczos [x]`,
+                  `[x][1:v] paletteuse=dither=sierra2_4a`
+                ])
+                .outputOption('-loop', options.loops)
+                .format('gif')
+                .save(outputPath) // Use save() instead of output().run()
+                .on('end', () => {
+                  console.log(`Success! GIF with crossfade saved to: ${path.resolve(outputPath)}`);
+                  resolve();
+                })
+                .on('error', (err) => {
+                  console.error('Error creating final GIF:', err.message);
+                  reject(err);
+                });
+            })
+            .on('error', (err) => {
+              console.error('Error generating palette:', err.message);
+              reject(err);
+            })
+            .run();
+        })
+        .on('error', (err) => {
+          console.error('Error creating crossfade video:', err.message);
+          reject(err);
+        })
+        .run();
+    });
+  } catch (error) {
+    console.error('Error in crossfade processing:', error.message);
+    throw error;
+  }
 }
 
 async function run() {
@@ -185,177 +347,137 @@ async function run() {
       }
     }
     
-    await new Promise((resolve, reject) => {
-      // Let's use a simpler approach first to see if it works
-      console.log('Converting video to GIF (this may take a while)...');
+    // Calculate file size estimate and warn for large files
+    const estimatedFrames = parseInt(options.fps) * parseInt(options.duration);
+    const estimatedPixels = parseInt(options.width) * parseInt(options.width) * 0.56; // Estimate height based on width
+    const estimatedSizeMB = (estimatedFrames * estimatedPixels * 3) / (8 * 1024 * 1024);
+    
+    const maxSizeMB = parseInt(options.maxSize);
+    
+    // Handle large file creation
+    if (estimatedSizeMB > maxSizeMB) {
+      console.warn(`Warning: The requested GIF may be very large (estimated ~${Math.round(estimatedSizeMB)}MB).`);
+      console.warn(`Maximum size set to ${maxSizeMB}MB. Adjusting parameters automatically.`);
       
-      // Generate a palette for better quality
-      const palettePath = path.join(tempDir, 'palette.png');
+      // Calculate how much we need to reduce
+      const reductionFactor = Math.sqrt(estimatedSizeMB / maxSizeMB);
       
-      // Calculate file size estimate and warn for large files
-      const estimatedFrames = parseInt(options.fps) * parseInt(options.duration);
-      const estimatedPixels = parseInt(options.width) * parseInt(options.width) * 0.56; // Estimate height based on width
-      const estimatedSizeMB = (estimatedFrames * estimatedPixels * 3) / (8 * 1024 * 1024);
+      // Reduce by adjusting width and FPS
+      const newWidth = Math.floor(parseInt(options.width) / reductionFactor);
+      const newFps = Math.max(10, Math.floor(parseInt(options.fps) / (reductionFactor * 0.7)));
       
-      const maxSizeMB = parseInt(options.maxSize);
+      console.warn(`Adjusting width from ${options.width}px to ${newWidth}px`);
+      console.warn(`Adjusting FPS from ${options.fps} to ${newFps}`);
       
-      // Handle large file creation
-      if (estimatedSizeMB > maxSizeMB) {
-        console.warn(`Warning: The requested GIF may be very large (estimated ~${Math.round(estimatedSizeMB)}MB).`);
-        console.warn(`Maximum size set to ${maxSizeMB}MB. Adjusting parameters automatically.`);
-        
-        // Calculate how much we need to reduce
-        const reductionFactor = Math.sqrt(estimatedSizeMB / maxSizeMB);
-        
-        // Reduce by adjusting width and FPS
-        const newWidth = Math.floor(parseInt(options.width) / reductionFactor);
-        const newFps = Math.max(10, Math.floor(parseInt(options.fps) / (reductionFactor * 0.7)));
-        
-        console.warn(`Adjusting width from ${options.width}px to ${newWidth}px`);
-        console.warn(`Adjusting FPS from ${options.fps} to ${newFps}`);
-        
-        options.width = newWidth.toString();
-        options.fps = newFps.toString();
-        
-        console.warn(`New estimated size: ~${Math.round(maxSizeMB)}MB`);
-        console.warn('Use -m option to change maximum size limit.');
-      }
+      options.width = newWidth.toString();
+      options.fps = newFps.toString();
       
-      console.log('Generating palette for high-quality GIF...');
+      console.warn(`New estimated size: ~${Math.round(maxSizeMB)}MB`);
+      console.warn('Use -m option to change maximum size limit.');
+    }
+    
+    // Check if crossfade is enabled
+    if (isCrossfadeEnabled()) {
+      console.log(`Creating GIF with crossfade effect of ${options.crossfade}s...`);
       console.log(`Settings: ${options.duration}s duration, ${options.width}px width, ${options.fps} FPS`);
       
-      // First pass - generate palette with tweaked settings for better performance
-      let ffmpegCommand = ffmpeg(videoPath)
-        .setStartTime(options.start)
-        .duration(options.duration)
-        .videoFilters([
-          `fps=${options.fps}`,
-          `scale=${options.width}:-1:flags=lanczos`,
-          'split[s0][s1]',
-          '[s0]palettegen=stats_mode=diff[p]',
-          '[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle'
-        ])
-        .outputOption('-loop', options.loops)
-        .format('gif')
-        .output(outputPath);
+      // Validate that crossfade duration is not longer than total duration
+      if (options.crossfade >= parseFloat(options.duration)) {
+        console.error('Error: Crossfade duration must be less than total duration');
+        console.error(`Current values: crossfade=${options.crossfade}s, duration=${options.duration}s`);
+        console.error('Please use a shorter crossfade duration or longer total duration');
+        process.exit(1);
+      }
       
-      ffmpegCommand.on('start', (commandLine) => {
-        if (options.verbose) {
-          console.log('FFmpeg command:', commandLine);
-        }
-      })
-        .on('progress', (progress) => {
-          if (options.verbose && progress.percent) {
-            console.log(`Processing: ${Math.floor(progress.percent)}% done`);
+      // Process with crossfade effect
+      await processCrossfade(videoPath, tempDir, outputPath);
+    } else {
+      // Standard processing without crossfade
+      await new Promise(async (resolve, reject) => {
+        console.log('Converting video to GIF (this may take a while)...');
+        console.log(`Settings: ${options.duration}s duration, ${options.width}px width, ${options.fps} FPS`);
+        
+        // Generate a palette for better quality
+        const palettePath = path.join(tempDir, 'palette.png');
+        
+        // First pass - generate palette with tweaked settings for better performance
+        let ffmpegCommand = ffmpeg(videoPath)
+          .setStartTime(options.start);
+          
+        // Regular approach
+          ffmpegCommand
+            .duration(options.duration)
+            .videoFilters([
+              `fps=${options.fps}`,
+              `scale=${options.width}:-1:flags=lanczos`,
+              'split[s0][s1]',
+              '[s0]palettegen=stats_mode=diff[p]',
+              '[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle'
+            ])
+            .outputOption('-loop', options.loops)
+            .format('gif')
+            .output(outputPath);
+        
+        ffmpegCommand.on('start', (commandLine) => {
+          if (options.verbose) {
+            console.log('FFmpeg command:', commandLine);
           }
         })
-        .on('end', () => {
-          console.log(`Success! GIF saved to: ${path.resolve(outputPath)}`);
-          resolve();
-        })
-        .on('error', (err) => {
-          console.error('Error during conversion:', err.message);
-          
-          // Try an alternative method with a two-pass approach
-          console.log('Trying alternative two-pass method...');
-          
-          // First create palette
-          let alternateFfmpeg = ffmpeg(videoPath)
-            .setStartTime(options.start);
-            
-          alternateFfmpeg
-            .duration(options.duration)
-            .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen`)
-            .output(palettePath);
-            
-          alternateFfmpeg.on('start', (commandLine) => {
-            if (options.verbose) {
-              console.log('Palette command:', commandLine);
+          .on('progress', (progress) => {
+            if (options.verbose && progress.percent) {
+              console.log(`Processing: ${Math.floor(progress.percent)}% done`);
             }
           })
-            .on('error', (paletteErr) => {
-              console.error('Error generating palette:', paletteErr.message);
+          .on('end', () => {
+            console.log(`Success! GIF saved to: ${path.resolve(outputPath)}`);
+            resolve();
+          })
+          .on('error', (err) => {
+            console.error('Error during conversion:', err.message);
+            
+            // Try an alternative method with a two-pass approach
+            console.log('Trying alternative two-pass method...');
+            
+            // First create palette
+            let alternateFfmpeg = ffmpeg(videoPath)
+              .setStartTime(options.start);
               
-              // Final fallback - simpler method
-              console.log('Using basic conversion as final fallback...');
+            // For alternate approach, use a simpler palette generation
+            alternateFfmpeg
+              .duration(parseFloat(options.duration))
+              .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen=stats_mode=diff`)
+              .output(palettePath);
               
-              ffmpeg(videoPath)
-                .setStartTime(options.start)
-                .duration(options.duration)
-                .outputOptions([
-                  '-vf', `fps=${options.fps},scale=${options.width}:-1:flags=lanczos`,
-                  '-loop', options.loops
-                ])
-                .format('gif')
-                .output(outputPath)
-                .on('start', (commandLine) => {
+            alternateFfmpeg.on('start', (commandLine) => {
+              if (options.verbose) {
+                console.log('Palette command:', commandLine);
+              }
+            })
+              .on('error', (paletteErr) => {
+                console.error('Error generating palette:', paletteErr.message);
+                
+                // Final fallback - simpler method
+                console.log('Using basic conversion as final fallback...');
+                
+                let fallbackFfmpeg = ffmpeg(videoPath)
+                  .setStartTime(options.start);
+                
+                // Standard approach
+                  fallbackFfmpeg
+                    .duration(options.duration)
+                    .outputOptions([
+                      '-vf', `fps=${options.fps},scale=${options.width}:-1:flags=lanczos`,
+                      '-loop', options.loops
+                    ])
+                    .format('gif')
+                    .output(outputPath);
+                
+                fallbackFfmpeg.on('start', (commandLine) => {
                   if (options.verbose) {
                     console.log('Fallback command:', commandLine);
                   }
                 })
-                .on('end', () => {
-                  console.log(`Success with fallback method! GIF saved to: ${path.resolve(outputPath)}`);
-                  resolve();
-                })
-                .on('error', (fallbackErr) => {
-                  console.error('All conversion methods failed:', fallbackErr.message);
-                  reject(fallbackErr);
-                })
-                .run();
-            })
-            .on('end', () => {
-              // Second pass - use palette to create high-quality GIF
-              let secondPassFfmpeg = ffmpeg(videoPath)
-                .setStartTime(options.start);
-                
-              {
-                // Standard two-pass approach without crossfade
-                secondPassFfmpeg
-                  .duration(options.duration)
-                  .videoFilter([
-                    `fps=${options.fps}`,
-                    `scale=${options.width}:-1:flags=lanczos`,
-                    `paletteuse=dither=sierra2_4a`
-                  ])
-                  .inputOptions([
-                    '-i', palettePath
-                  ])
-                  .outputOption('-loop', options.loops)
-                  .format('gif')
-                  .output(outputPath);
-              }
-              
-              secondPassFfmpeg.on('start', (commandLine) => {
-                if (options.verbose) {
-                  console.log('Second pass command:', commandLine);
-                }
-              })
-                .on('end', () => {
-                  console.log(`Success with two-pass method! GIF saved to: ${path.resolve(outputPath)}`);
-                  resolve();
-                })
-                .on('error', (secondPassErr) => {
-                  console.error('Error in second pass:', secondPassErr.message);
-                  
-                  // Fall back to the basic method
-                  console.log('Using basic conversion as fallback...');
-                  
-                  let fallbackFfmpeg = ffmpeg(videoPath)
-                    .setStartTime(options.start);
-                  
-                  {
-                    // Original fallback without crossfade
-                    fallbackFfmpeg
-                      .duration(options.duration)
-                      .outputOptions([
-                        '-vf', `fps=${options.fps},scale=${options.width}:-1:flags=lanczos`,
-                        '-loop', options.loops
-                      ])
-                      .format('gif')
-                      .output(outputPath);
-                  }
-                  
-                  fallbackFfmpeg.on('end', () => {
+                  .on('end', () => {
                     console.log(`Success with fallback method! GIF saved to: ${path.resolve(outputPath)}`);
                     resolve();
                   })
@@ -364,13 +486,72 @@ async function run() {
                     reject(fallbackErr);
                   })
                   .run();
+              })
+              .on('end', () => {
+                // Second pass - use palette to create high-quality GIF
+                let secondPassFfmpeg = ffmpeg(videoPath)
+                  .setStartTime(options.start);
+                  
+                // Standard two-pass approach
+                  secondPassFfmpeg
+                    .duration(options.duration)
+                    .videoFilter([
+                      `fps=${options.fps}`,
+                      `scale=${options.width}:-1:flags=lanczos`,
+                      `paletteuse=dither=sierra2_4a`
+                    ])
+                    .inputOptions([
+                      '-i', palettePath
+                    ])
+                    .outputOption('-loop', options.loops)
+                    .format('gif')
+                    .output(outputPath);
+                
+                secondPassFfmpeg.on('start', (commandLine) => {
+                  if (options.verbose) {
+                    console.log('Second pass command:', commandLine);
+                  }
                 })
-                .run();
-            })
-            .run();
-        })
-        .run();
-    });
+                  .on('end', () => {
+                    console.log(`Success with two-pass method! GIF saved to: ${path.resolve(outputPath)}`);
+                    resolve();
+                  })
+                  .on('error', (secondPassErr) => {
+                    console.error('Error in second pass:', secondPassErr.message);
+                    
+                    // Fall back to the basic method
+                    console.log('Using basic conversion as fallback...');
+                    
+                    let fallbackFfmpeg = ffmpeg(videoPath)
+                      .setStartTime(options.start);
+                    
+                    // Original fallback approach
+                    fallbackFfmpeg
+                      .duration(options.duration)
+                      .outputOptions([
+                        '-vf', `fps=${options.fps},scale=${options.width}:-1:flags=lanczos`,
+                        '-loop', options.loops
+                      ])
+                      .format('gif')
+                      .output(outputPath);
+                    
+                    fallbackFfmpeg.on('end', () => {
+                      console.log(`Success with fallback method! GIF saved to: ${path.resolve(outputPath)}`);
+                      resolve();
+                    })
+                    .on('error', (fallbackErr) => {
+                      console.error('All conversion methods failed:', fallbackErr.message);
+                      reject(fallbackErr);
+                    })
+                    .run();
+                  })
+                  .run();
+              })
+              .run();
+          })
+          .run();
+      });
+    }
     
   } catch (error) {
     console.error('Error:', error.message);
