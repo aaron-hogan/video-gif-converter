@@ -6,6 +6,8 @@ const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFile } = require('child_process');
+const gifsicle = require('gifsicle');
 
 // Check if FFmpeg is installed
 try {
@@ -16,6 +18,29 @@ try {
   console.error('For macOS: brew install ffmpeg');
   console.error('For Ubuntu/Debian: sudo apt install ffmpeg');
   process.exit(1);
+}
+
+// Check if gifsicle is available (either via npm package or system installation)
+let gifsicleAvailable = false;
+let gifsicleExePath = null;
+
+try {
+  // First try to get the gifsicle binary path from the npm package
+  gifsicleExePath = require('gifsicle');
+  gifsicleAvailable = true;
+} catch (e) {
+  // Then try to check if gifsicle is available in system path
+  try {
+    require('child_process').execSync('gifsicle --version', { stdio: 'ignore' });
+    gifsicleExePath = 'gifsicle';
+    gifsicleAvailable = true;
+  } catch (err) {
+    console.warn('Warning: Gifsicle not found. Advanced compression will be disabled.');
+    console.warn('To enable better compression, install gifsicle:');
+    console.warn(' - macOS: brew install gifsicle');
+    console.warn(' - Ubuntu/Debian: sudo apt install gifsicle');
+    console.warn(' - npm: npm install gifsicle');
+  }
 }
 
 program
@@ -34,13 +59,18 @@ program
   .option('-m, --max-size <mb>', 'Maximum output file size in MB (constrains quality automatically)', '50')
   .option('-c, --crossfade <seconds>', 'Apply crossfade effect for looping, duration in seconds', '0')
   .option('-p, --speed <factor>', 'Playback speed (0.5 = half speed, 2.0 = double speed)', '1.0')
+  .option('--colors <number>', 'Maximum number of colors in the palette (2-256, fewer colors = smaller files)', '256')
+  .option('--lossy <level>', 'Lossy compression level (1-100, higher = smaller files but lower quality)', '80') 
+  .option('--dither <type>', 'Dithering method (none, floyd_steinberg, bayer, sierra2_4a)', 'sierra2_4a')
   .parse(process.argv);
 
 const options = program.opts();
 
-// Convert numeric options to float
+// Convert numeric options to appropriate types
 options.crossfade = parseFloat(options.crossfade);
 options.speed = parseFloat(options.speed);
+options.colors = parseInt(options.colors);
+options.lossy = parseInt(options.lossy);
 
 // Validate speed option
 if (isNaN(options.speed) || options.speed <= 0) {
@@ -50,6 +80,25 @@ if (isNaN(options.speed) || options.speed <= 0) {
 
 if (options.speed < 0.25 || options.speed > 4.0) {
   console.warn('Warning: Speed values outside the range of 0.25-4.0 may produce unexpected results');
+}
+
+// Validate colors option
+if (isNaN(options.colors) || options.colors < 2 || options.colors > 256) {
+  console.error('Error: Colors must be a number between 2 and 256');
+  process.exit(1);
+}
+
+// Validate lossy option
+if (isNaN(options.lossy) || options.lossy < 0 || options.lossy > 100) {
+  console.error('Error: Lossy compression level must be a number between 0 and 100');
+  process.exit(1);
+}
+
+// Validate dither option
+const validDithers = ['none', 'floyd_steinberg', 'bayer', 'sierra2_4a'];
+if (!validDithers.includes(options.dither)) {
+  console.error(`Error: Dither must be one of: ${validDithers.join(', ')}`);
+  process.exit(1);
 }
 
 // Function to check if crossfade is enabled
@@ -180,7 +229,7 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
           
           // First generate the palette
           ffmpeg(tempVideoPath)
-            .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen=stats_mode=diff`)
+            .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen=stats_mode=diff:max_colors=${options.colors}`)
             .output(palettePath)
             .on('end', () => {
               console.log('Palette generated, creating final GIF...');
@@ -190,12 +239,18 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
                 .input(palettePath)
                 .complexFilter([
                   `fps=${options.fps},scale=${options.width}:-1:flags=lanczos [x]`,
-                  `[x][1:v] paletteuse=dither=sierra2_4a`
+                  `[x][1:v] paletteuse=dither=${options.dither}`
                 ])
                 .outputOption('-loop', options.loops)
                 .format('gif')
                 .save(outputPath) // Use save() instead of output().run()
-                .on('end', () => {
+                .on('end', async () => {
+                  // Apply post-processing with gifsicle for better compression
+                  try {
+                    await postProcessGif(outputPath, options);
+                  } catch (err) {
+                    console.error('Error during post-processing:', err.message);
+                  }
                   console.log(`Success! GIF with crossfade saved to: ${path.resolve(outputPath)}`);
                   resolve();
                 })
@@ -220,6 +275,103 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
     console.error('Error in crossfade processing:', error.message);
     throw error;
   }
+}
+
+/**
+ * Post-process a GIF file to optimize and compress it
+ * @param {string} inputPath - Path to the input GIF
+ * @param {object} options - Compression options
+ * @param {number} options.colors - Number of colors (2-256)
+ * @param {number} options.lossy - Lossy compression level (1-100)
+ * @param {string} options.dither - Dithering method
+ * @returns {Promise<void>} - Resolves when compression is complete
+ */
+async function postProcessGif(inputPath, options) {
+  return new Promise((resolve, reject) => {
+    // Skip if gifsicle is not available
+    if (!gifsicleAvailable) {
+      console.warn('Skipping optimization (gifsicle not available)');
+      return resolve();
+    }
+    
+    // Skip optimization if colors are 256 and lossy is 0
+    if (options.colors === 256 && options.lossy === 0) {
+      console.log('Skipping optimization (using maximum quality settings)');
+      return resolve();
+    }
+    
+    console.log('Optimizing GIF to reduce file size...');
+    
+    // Calculate original file size
+    const originalSize = fs.statSync(inputPath).size / (1024 * 1024); // in MB
+    
+    // Build gifsicle arguments
+    const args = [
+      '--optimize=3', // Highest optimization level
+      '--no-warnings',
+      `--colors=${options.colors}`
+    ];
+    
+    // Add lossy compression if enabled
+    if (options.lossy > 0) {
+      args.push(`--lossy=${options.lossy}`);
+    }
+    
+    // Add dithering option
+    if (options.dither === 'none') {
+      args.push('--no-dither');
+    } else if (options.dither === 'floyd_steinberg') {
+      args.push('--dither=floyd-steinberg');
+    } else if (options.dither === 'bayer') {
+      args.push('--dither=ordered');
+    } // sierra2_4a is used by default in gifsicle
+    
+    // Create a temporary path for the optimized GIF
+    const tempPath = `${inputPath}.tmp`;
+    args.push('--output', tempPath, inputPath);
+    
+    if (options.verbose) {
+      console.log(`Gifsicle arguments: ${args.join(' ')}`);
+    }
+    
+    // Use the gifsicle path we determined earlier
+    let gifsicleExe = gifsicleExePath;
+    
+    // If the path is an object (from npm package), extract the actual path
+    if (typeof gifsicleExe === 'object' && gifsicleExe !== null) {
+      if (gifsicleExe.path) {
+        gifsicleExe = gifsicleExe.path;
+      } else if (gifsicleExe.bin) {
+        gifsicleExe = gifsicleExe.bin;
+      } else {
+        // If we can't find the path in the object, use system gifsicle
+        gifsicleExe = 'gifsicle';
+      }
+    }
+    
+    if (options.verbose) {
+      console.log(`Using gifsicle: ${gifsicleExe}`);
+    }
+    
+    execFile(gifsicleExe, args, (error) => {
+      if (error) {
+        console.error('Error optimizing GIF:', error.message);
+        console.warn('Using original unoptimized GIF');
+        return resolve();
+      }
+      
+      // Replace the original file with the optimized one
+      fs.unlinkSync(inputPath);
+      fs.renameSync(tempPath, inputPath);
+      
+      // Calculate compression ratio
+      const newSize = fs.statSync(inputPath).size / (1024 * 1024); // in MB
+      const savingsPercent = ((originalSize - newSize) / originalSize) * 100;
+      
+      console.log(`GIF optimized: ${originalSize.toFixed(2)}MB → ${newSize.toFixed(2)}MB (${savingsPercent.toFixed(1)}% smaller)`);
+      resolve();
+    });
+  });
 }
 
 /**
@@ -473,8 +625,8 @@ async function run() {
               `fps=${options.fps}`,
               `scale=${options.width}:-1:flags=lanczos`,
               'split[s0][s1]',
-              '[s0]palettegen=stats_mode=diff[p]',
-              '[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle'
+              `[s0]palettegen=stats_mode=diff:max_colors=${options.colors}[p]`,
+              `[s1][p]paletteuse=dither=${options.dither === 'bayer' ? 'bayer:bayer_scale=5' : options.dither}:diff_mode=rectangle`
             ])
             .outputOption('-loop', options.loops)
             .format('gif')
@@ -490,7 +642,13 @@ async function run() {
               console.log(`Processing: ${Math.floor(progress.percent)}% done`);
             }
           })
-          .on('end', () => {
+          .on('end', async () => {
+            // Apply post-processing with gifsicle for better compression
+            try {
+              await postProcessGif(outputPath, options);
+            } catch (err) {
+              console.error('Error during post-processing:', err.message);
+            }
             console.log(`Success! GIF saved to: ${path.resolve(outputPath)}`);
             resolve();
           })
@@ -507,7 +665,7 @@ async function run() {
             // For alternate approach, use a simpler palette generation
             alternateFfmpeg
               .duration(parseFloat(options.duration))
-              .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen=stats_mode=diff`)
+              .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen=stats_mode=diff:max_colors=${options.colors}`)
               .output(palettePath);
               
             alternateFfmpeg.on('start', (commandLine) => {
@@ -539,7 +697,13 @@ async function run() {
                     console.log('Fallback command:', commandLine);
                   }
                 })
-                  .on('end', () => {
+                  .on('end', async () => {
+                    // Apply post-processing with gifsicle for better compression
+                    try {
+                      await postProcessGif(outputPath, options);
+                    } catch (err) {
+                      console.error('Error during post-processing:', err.message);
+                    }
                     console.log(`Success with fallback method! GIF saved to: ${path.resolve(outputPath)}`);
                     resolve();
                   })
@@ -560,7 +724,7 @@ async function run() {
                     .videoFilter([
                       `fps=${options.fps}`,
                       `scale=${options.width}:-1:flags=lanczos`,
-                      `paletteuse=dither=sierra2_4a`
+                      `paletteuse=dither=${options.dither}:diff_mode=rectangle`
                     ])
                     .inputOptions([
                       '-i', palettePath
@@ -574,7 +738,13 @@ async function run() {
                     console.log('Second pass command:', commandLine);
                   }
                 })
-                  .on('end', () => {
+                  .on('end', async () => {
+                    // Apply post-processing with gifsicle for better compression
+                    try {
+                      await postProcessGif(outputPath, options);
+                    } catch (err) {
+                      console.error('Error during post-processing:', err.message);
+                    }
                     console.log(`Success with two-pass method! GIF saved to: ${path.resolve(outputPath)}`);
                     resolve();
                   })
@@ -597,7 +767,13 @@ async function run() {
                       .format('gif')
                       .output(outputPath);
                     
-                    fallbackFfmpeg.on('end', () => {
+                    fallbackFfmpeg.on('end', async () => {
+                      // Apply post-processing with gifsicle for better compression
+                      try {
+                        await postProcessGif(outputPath, options);
+                      } catch (err) {
+                        console.error('Error during post-processing:', err.message);
+                      }
                       console.log(`Success with fallback method! GIF saved to: ${path.resolve(outputPath)}`);
                       resolve();
                     })

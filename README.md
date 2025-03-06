@@ -69,6 +69,9 @@ vgif --input "path/to/video.mp4"
 - `-m, --max-size <mb>` - Maximum output file size in MB (default: 50)
 - `-c, --crossfade <seconds>` - Apply crossfade effect for seamless looping (default: 0)
 - `-p, --speed <factor>` - Playback speed (0.5 = half speed, 2.0 = double speed) (default: 1.0)
+- `--colors <number>` - Maximum number of colors (2-256, fewer colors = smaller files) (default: 256)
+- `--lossy <level>` - Lossy compression level (1-100, higher = smaller files but lower quality) (default: 80)
+- `--dither <type>` - Dithering method: none, floyd_steinberg, bayer, sierra2_4a (default: sierra2_4a)
 
 Note: You must provide either a YouTube URL (-u) OR a local file path (-i), not both.
 
@@ -113,6 +116,15 @@ vgif -i "path/to/video.mp4" -p 2.0
 
 # Combine speed control with crossfade for creative effects
 vgif -i "path/to/video.mp4" -d 8 -p 0.75 -c 1.0
+
+# Create a highly compressed GIF with fewer colors
+vgif -i "path/to/video.mp4" --colors 64 --lossy 90
+
+# Use different dithering for artistic effect
+vgif -i "path/to/video.mp4" --dither bayer
+
+# Create a small file size GIF with aggressive compression
+vgif -i "path/to/video.mp4" -w 320 -f 10 --colors 32 --lossy 95
 ```
 
 ### Tips
@@ -123,6 +135,8 @@ vgif -i "path/to/video.mp4" -d 8 -p 0.75 -c 1.0
 4. **Loop Count**: Use `-l 0` for infinite loops or specify a number for limited loops
 5. **Crossfade Effect**: For seamless looping, try a crossfade duration of 0.5-2 seconds (must be less than total duration)
 6. **Speed Control**: Use `-p 0.5` for slow motion or `-p 2.0` for time-lapse effects
+7. **File Size Reduction**: To create smaller files, try reducing colors (`--colors 64`), adding lossy compression (`--lossy 85`), and using simpler dithering (`--dither floyd_steinberg`)
+8. **Quality vs Size**: For maximum quality, use `--colors 256 --lossy 0 --dither sierra2_4a`; for minimum size, try `--colors 32 --lossy 95 --dither none`
 
 ## License
 

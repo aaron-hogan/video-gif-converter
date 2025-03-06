@@ -21,6 +21,7 @@
   "dependencies": {
     "@distube/ytdl-core": "^4.16.4",
     "commander": "^13.1.0",
-    "fluent-ffmpeg": "^2.1.3"
+    "fluent-ffmpeg": "^2.1.3",
+    "gifsicle": "^7.0.1"
   }
 }
