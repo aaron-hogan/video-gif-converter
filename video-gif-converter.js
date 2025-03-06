@@ -57,13 +57,22 @@ if (options.url && options.input) {
   process.exit(1);
 }
 
-// The direct crossfade approach doesn't need these separate clip functions anymore
-
-// Function to process the crossfade and create final GIF
+/**
+ * Function to create a crossfade effect for perfectly looping GIFs.
+ * 
+ * This implementation follows these principles:
+ * 1. The base clip starts at (start_time + crossfade_duration) and plays for (total_duration - crossfade_duration)
+ * 2. The crossfade clip contains the first (crossfade_duration) seconds of video from start_time
+ * 3. When the base clip ends, it transitions smoothly into the crossfade clip
+ * 4. This creates a seamless loop where the end blends perfectly into the beginning
+ *
+ * @param {string} videoPath - Path to the source video
+ * @param {string} tempDir - Temporary directory for processing files
+ * @param {string} outputPath - Path where the final GIF will be saved
+ * @returns {Promise} - Resolves when GIF is created
+ */
 async function processCrossfade(videoPath, tempDir, outputPath) {
   try {
-    // Use a simpler approach - create a single clip with the crossfade effect 
-    // applied directly instead of trying to combine separate clips
     console.log('Creating crossfade effect directly...');
     
     // Generate palette for better quality
@@ -72,58 +81,42 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
     // Create a temporary video with crossfade
     const tempVideoPath = path.join(tempDir, 'crossfade_video.mp4');
     
-    // Calculate the total video length needed
+    // Parse durations and calculate timing
     const totalDuration = parseFloat(options.duration);
     const crossfadeDuration = options.crossfade;
+    const startTime = parseFloat(options.start);
+    const mainDuration = totalDuration - crossfadeDuration;
+    
+    // Offset where the base clip starts - after the crossfade duration
+    const baseOffset = crossfadeDuration;
     
     return new Promise((resolve, reject) => {
-      // DEBUG VERSION with visual aids to show what's happening
-      const startTime = parseFloat(options.start);
+      // Create a complex filter to generate a perfect crossfade
+      let complexFilter = [
+        // Main section (starts after crossfade duration)
+        `[0:v]trim=start=${startTime + baseOffset}:duration=${mainDuration},setpts=PTS-STARTPTS[main]`,
+        
+        // End segment with fade out
+        `[0:v]trim=start=${startTime + mainDuration + baseOffset}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,format=yuva420p,fade=t=out:st=0:d=${crossfadeDuration}:alpha=1[fout]`,
+        
+        // Beginning segment with fade in (from the original start time)
+        `[0:v]trim=start=${startTime}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,format=yuva420p,fade=t=in:st=0:d=${crossfadeDuration}:alpha=1[fin]`,
+        
+        // Overlay the fading segments to create transition
+        `[fin][fout]overlay[crossfade]`,
+        
+        // Join the main part with the crossfade section
+        `[main][crossfade]concat=n=2:v=1:a=0`
+      ].join(';');
       
-      // We'll create separate segments with visual debugging info
-      const mainDuration = totalDuration - crossfadeDuration;
-      
-      // Much simpler and more reliable approach for crossfade
-      
+      /* 
+      // DEBUG VERSION with visual timecodes - uncomment if needed for troubleshooting
       if (options.verbose) {
-        console.log("Creating debug version with color indicators");
-        
-        // Create a marked version for debugging with color indicators
         complexFilter = [
-          // Main section (before crossfade) with RED box at top
-          `[0:v]trim=start=${startTime}:duration=${mainDuration},setpts=PTS-STARTPTS,drawbox=x=0:y=0:w=480:h=20:color=red@0.5:t=fill[main]`,
-          
-          // Second part - create a crossfade between end and beginning
-          // We'll add a YELLOW box to the ending segment
-          `[0:v]trim=start=${startTime + mainDuration}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,drawbox=x=0:y=0:w=480:h=20:color=yellow@0.5:t=fill[end]`,
-          
-          // Beginning segment with BLUE box
-          `[0:v]trim=start=${startTime}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,drawbox=x=0:y=0:w=480:h=20:color=blue@0.5:t=fill[begin]`,
-          
-          // Create a true crossfade by using overlay with transparency
-          // First apply fade out to ending segment
-          `[end]format=yuva420p,fade=t=out:st=0:d=${crossfadeDuration}:alpha=1[fout]`,
-          
-          // Apply fade in to beginning segment
-          `[begin]format=yuva420p,fade=t=in:st=0:d=${crossfadeDuration}:alpha=1[fin]`,
-          
-          // Overlay them with the first one below
-          `[fin][fout]overlay[crossfade]`,
-          
-          // Now join the main part with the crossfade
-          `[main][crossfade]concat=n=2:v=1:a=0`
-        ].join(';');
-      } else {
-        // Simplified timecodes with larger font size
-        // Adjust base clip to start after crossfade duration, as per the plan
-        const baseOffset = options.crossfade;
-        console.log(`Base clip starts at: ${startTime + baseOffset}s`);
-        
-        complexFilter = [
-          // Main section with RED timestamp (start after crossfade)
+          // Main section with RED timestamp
           `[0:v]trim=start=${startTime + baseOffset}:duration=${mainDuration},setpts=PTS-STARTPTS,drawtext=text='MAIN %{pts\\:hms}':x=10:y=10:fontsize=36:fontcolor=red:box=1:boxcolor=black@0.5[main]`,
           
-          // End segment with fade out (no timestamp)
+          // End segment with fade out
           `[0:v]trim=start=${startTime + mainDuration + baseOffset}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,format=yuva420p,fade=t=out:st=0:d=${crossfadeDuration}:alpha=1[fout]`,
           
           // Beginning segment with BLUE timestamp in top-right
@@ -136,6 +129,7 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
           `[main][crossfade]concat=n=2:v=1:a=0`
         ].join(';');
       }
+      */
       
       ffmpeg(videoPath)
         .complexFilter(complexFilter)
@@ -143,7 +137,7 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
         .outputOptions(['-map', '0:a?']) // Include audio if present
         .on('start', (commandLine) => {
           if (options.verbose) {
-            console.log('Crossfade command:', commandLine);
+            console.log('FFmpeg command:', commandLine);
           }
         })
         .on('end', () => {
