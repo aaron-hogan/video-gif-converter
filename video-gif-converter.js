@@ -9,6 +9,14 @@ const os = require('os');
 const { execFile } = require('child_process');
 const gifsicle = require('gifsicle');
 const v8 = require('v8');
+const crypto = require('crypto');
+
+// Cache configuration
+const CACHE_DIR = path.join(os.homedir(), '.vgif-cache');
+const CACHE_MAX_SIZE_MB = 2048; // 2GB default cache size limit
+const CACHE_MAX_AGE_DAYS = 7; // 1 week max cache age
+const DEFAULT_RETRY_ATTEMPTS = 3;
+const DEFAULT_RETRY_DELAY_MS = 1000;
 
 // Check if FFmpeg is installed
 try {
@@ -65,6 +73,10 @@ program
   .option('--dither <type>', 'Dithering method (none, floyd_steinberg, bayer, sierra2_4a)', 'sierra2_4a')
   .option('--memory-limit <mb>', 'Maximum memory usage in MB (0 = no limit)', '2048')
   .option('--threads <count>', 'Number of FFmpeg threads to use (0 = auto)', '0')
+  .option('--no-cache', 'Disable caching for YouTube downloads')
+  .option('--cache-dir <path>', 'Directory to store downloaded video cache', CACHE_DIR)
+  .option('--cache-size <mb>', 'Maximum cache size in MB', String(CACHE_MAX_SIZE_MB))
+  .option('--quality <value>', 'Video quality to download (lowest, low, medium, high, highest)', 'auto')
   .parse(process.argv);
 
 const options = program.opts();
@@ -76,6 +88,7 @@ options.colors = parseInt(options.colors);
 options.lossy = parseInt(options.lossy);
 options.memoryLimit = parseInt(options.memoryLimit);
 options.threads = parseInt(options.threads);
+options.cacheSize = parseInt(options.cacheSize);
 
 // Validate speed option
 if (isNaN(options.speed) || options.speed <= 0) {
@@ -106,14 +119,28 @@ if (!validDithers.includes(options.dither)) {
   process.exit(1);
 }
 
-// Validate memory limit and threads options
-if (options.memoryLimit < 0) {
+// Validate memory limit
+if (isNaN(options.memoryLimit) || options.memoryLimit < 0) {
   console.error('Error: Memory limit must be a non-negative number');
   process.exit(1);
 }
 
-if (options.threads < 0) {
+// Validate threads
+if (isNaN(options.threads) || options.threads < 0) {
   console.error('Error: Thread count must be a non-negative number');
+  process.exit(1);
+}
+
+// Validate cache size
+if (isNaN(options.cacheSize) || options.cacheSize < 0) {
+  console.error('Error: Cache size must be a non-negative number');
+  process.exit(1);
+}
+
+// Validate quality option
+const validQualities = ['auto', 'lowest', 'low', 'medium', 'high', 'highest'];
+if (!validQualities.includes(options.quality)) {
+  console.error(`Error: Quality must be one of: ${validQualities.join(', ')}`);
   process.exit(1);
 }
 
@@ -164,6 +191,658 @@ function logMemoryUsage() {
   if (options.memoryLimit > 0) {
     console.log(`  Memory limit: ${options.memoryLimit}MB (${Math.round(memUsage.rss / options.memoryLimit * 100)}% used)`);
   }
+}
+
+/**
+ * Create cache directory if it doesn't exist
+ */
+function initializeCache() {
+  if (!options.cache) {
+    if (options.verbose) {
+      console.log('Cache disabled with --no-cache flag');
+    }
+    return false;
+  }
+  
+  try {
+    // Ensure cache directory exists
+    if (!fs.existsSync(options.cacheDir)) {
+      fs.mkdirSync(options.cacheDir, { recursive: true });
+      if (options.verbose) {
+        console.log(`Created cache directory: ${options.cacheDir}`);
+      }
+    }
+    
+    // Create segments directory
+    const segmentsDir = path.join(options.cacheDir, 'segments');
+    if (!fs.existsSync(segmentsDir)) {
+      fs.mkdirSync(segmentsDir, { recursive: true });
+    }
+    
+    // Create info directory
+    const infoDir = path.join(options.cacheDir, 'info');
+    if (!fs.existsSync(infoDir)) {
+      fs.mkdirSync(infoDir, { recursive: true });
+    }
+    
+    // Clean cache if it exceeds size limit
+    cleanupCache();
+    return true;
+  } catch (err) {
+    console.warn(`Warning: Could not initialize cache: ${err.message}`);
+    console.warn('Continuing without caching');
+    return false;
+  }
+}
+
+/**
+ * Get cache key from URL and time range
+ * @param {string} videoId - YouTube video ID
+ * @param {number} start - Start time in seconds
+ * @param {number} duration - Duration in seconds
+ * @returns {string} - Cache key
+ */
+function getCacheKey(videoId, start, duration) {
+  const hash = crypto.createHash('md5').update(`${videoId}|${start}|${duration}`).digest('hex');
+  return hash;
+}
+
+/**
+ * Check if a segment is cached
+ * @param {string} videoId - YouTube video ID
+ * @param {number} start - Start time in seconds
+ * @param {number} duration - Duration in seconds
+ * @returns {string|null} - Path to cached segment or null if not cached
+ */
+function getCachedSegment(videoId, start, duration) {
+  if (!options.cache) return null;
+  
+  const cacheKey = getCacheKey(videoId, start, duration);
+  const cachedSegmentPath = path.join(options.cacheDir, 'segments', `${cacheKey}.mp4`);
+  
+  if (fs.existsSync(cachedSegmentPath)) {
+    const stats = fs.statSync(cachedSegmentPath);
+    const fileAgeDays = (Date.now() - stats.mtime.getTime()) / (1000 * 60 * 60 * 24);
+    
+    // Check if the file is not too old and not empty
+    if (fileAgeDays <= CACHE_MAX_AGE_DAYS && stats.size > 0) {
+      if (options.verbose) {
+        console.log(`Using cached segment: ${cachedSegmentPath}`);
+      }
+      return cachedSegmentPath;
+    }
+    
+    // Remove stale cache entry
+    try {
+      fs.unlinkSync(cachedSegmentPath);
+    } catch (err) {
+      console.warn(`Warning: Could not remove stale cache entry: ${err.message}`);
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Save segment to cache
+ * @param {string} videoId - YouTube video ID
+ * @param {number} start - Start time in seconds
+ * @param {number} duration - Duration in seconds
+ * @param {string} segmentPath - Path to segment file
+ * @returns {string} - Path to cached segment
+ */
+function saveCachedSegment(videoId, start, duration, segmentPath) {
+  if (!options.cache) return segmentPath;
+  
+  try {
+    const cacheKey = getCacheKey(videoId, start, duration);
+    const cachedSegmentPath = path.join(options.cacheDir, 'segments', `${cacheKey}.mp4`);
+    
+    // Copy segment to cache
+    fs.copyFileSync(segmentPath, cachedSegmentPath);
+    
+    if (options.verbose) {
+      console.log(`Saved segment to cache: ${cachedSegmentPath}`);
+    }
+    
+    return cachedSegmentPath;
+  } catch (err) {
+    console.warn(`Warning: Could not save segment to cache: ${err.message}`);
+    return segmentPath;
+  }
+}
+
+/**
+ * Get cached video info
+ * @param {string} videoId - YouTube video ID
+ * @returns {object|null} - Cached video info or null if not cached
+ */
+function getCachedVideoInfo(videoId) {
+  if (!options.cache) return null;
+  
+  const cacheInfoPath = path.join(options.cacheDir, 'info', `${videoId}.json`);
+  
+  if (fs.existsSync(cacheInfoPath)) {
+    const stats = fs.statSync(cacheInfoPath);
+    const fileAgeDays = (Date.now() - stats.mtime.getTime()) / (1000 * 60 * 60 * 24);
+    
+    // Check if the file is not too old
+    if (fileAgeDays <= CACHE_MAX_AGE_DAYS) {
+      try {
+        const infoData = fs.readFileSync(cacheInfoPath, 'utf8');
+        const info = JSON.parse(infoData);
+        if (options.verbose) {
+          console.log(`Using cached video info for: ${videoId}`);
+        }
+        return info;
+      } catch (err) {
+        console.warn(`Warning: Could not read cached video info: ${err.message}`);
+      }
+    }
+    
+    // Remove stale cache entry
+    try {
+      fs.unlinkSync(cacheInfoPath);
+    } catch (err) {
+      console.warn(`Warning: Could not remove stale cache info: ${err.message}`);
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Save video info to cache
+ * @param {string} videoId - YouTube video ID
+ * @param {object} info - Video info object
+ */
+function saveCachedVideoInfo(videoId, info) {
+  if (!options.cache) return;
+  
+  try {
+    const cacheInfoPath = path.join(options.cacheDir, 'info', `${videoId}.json`);
+    fs.writeFileSync(cacheInfoPath, JSON.stringify(info, null, 2));
+    
+    if (options.verbose) {
+      console.log(`Saved video info to cache: ${cacheInfoPath}`);
+    }
+  } catch (err) {
+    console.warn(`Warning: Could not save video info to cache: ${err.message}`);
+  }
+}
+
+/**
+ * Clean up cache based on size and age limits
+ */
+function cleanupCache() {
+  if (!options.cache) return;
+  
+  try {
+    // Get all cache files
+    const segmentsDir = path.join(options.cacheDir, 'segments');
+    const infoDir = path.join(options.cacheDir, 'info');
+    
+    // Get all cache files with stats
+    const cacheFiles = [];
+    
+    // Add segment files
+    if (fs.existsSync(segmentsDir)) {
+      fs.readdirSync(segmentsDir).forEach(file => {
+        const filePath = path.join(segmentsDir, file);
+        const stats = fs.statSync(filePath);
+        cacheFiles.push({
+          path: filePath,
+          size: stats.size,
+          mtime: stats.mtime.getTime()
+        });
+      });
+    }
+    
+    // Add info files
+    if (fs.existsSync(infoDir)) {
+      fs.readdirSync(infoDir).forEach(file => {
+        const filePath = path.join(infoDir, file);
+        const stats = fs.statSync(filePath);
+        cacheFiles.push({
+          path: filePath,
+          size: stats.size,
+          mtime: stats.mtime.getTime()
+        });
+      });
+    }
+    
+    // First remove files that are too old
+    const now = Date.now();
+    const maxAge = CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+    
+    const filesToRemove = cacheFiles.filter(file => {
+      return (now - file.mtime) > maxAge;
+    });
+    
+    // Remove old files
+    filesToRemove.forEach(file => {
+      try {
+        fs.unlinkSync(file.path);
+        if (options.verbose) {
+          console.log(`Removed stale cache file: ${file.path}`);
+        }
+      } catch (err) {
+        console.warn(`Warning: Could not remove cache file: ${err.message}`);
+      }
+    });
+    
+    // Then check total cache size and remove oldest files if needed
+    const remainingFiles = cacheFiles.filter(file => !filesToRemove.includes(file))
+      .sort((a, b) => a.mtime - b.mtime); // Sort by age, oldest first
+    
+    let totalSize = remainingFiles.reduce((sum, file) => sum + file.size, 0);
+    const maxSize = options.cacheSize * 1024 * 1024; // Convert MB to bytes
+    
+    // Remove oldest files if cache exceeds size limit
+    while (totalSize > maxSize && remainingFiles.length > 0) {
+      const oldestFile = remainingFiles.shift();
+      
+      try {
+        fs.unlinkSync(oldestFile.path);
+        totalSize -= oldestFile.size;
+        
+        if (options.verbose) {
+          console.log(`Removed old cache file to save space: ${oldestFile.path}`);
+        }
+      } catch (err) {
+        console.warn(`Warning: Could not remove cache file: ${err.message}`);
+      }
+    }
+    
+    if (options.verbose) {
+      const currentSizeMB = Math.round(totalSize / (1024 * 1024));
+      console.log(`Cache size after cleanup: ${currentSizeMB}MB / ${options.cacheSize}MB`);
+    }
+  } catch (err) {
+    console.warn(`Warning: Error during cache cleanup: ${err.message}`);
+  }
+}
+
+/**
+ * Execute an async function with retry logic
+ * @param {Function} fn - Async function to execute
+ * @param {number} [maxRetries=3] - Maximum number of retry attempts
+ * @param {number} [delay=1000] - Delay between retries in milliseconds
+ * @param {Function} [onRetry] - Function to call on retry
+ * @returns {Promise<any>} - Result of the function
+ */
+async function withRetry(fn, maxRetries = DEFAULT_RETRY_ATTEMPTS, delay = DEFAULT_RETRY_DELAY_MS, onRetry = null) {
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      
+      // Don't retry on final attempt
+      if (attempt <= maxRetries) {
+        const retryDelay = delay * Math.pow(1.5, attempt - 1); // Exponential backoff
+        
+        if (onRetry) {
+          onRetry(err, attempt, maxRetries);
+        } else if (options.verbose) {
+          console.warn(`Attempt ${attempt}/${maxRetries + 1} failed: ${err.message}`);
+          console.warn(`Retrying in ${Math.round(retryDelay / 1000)} seconds...`);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
+/**
+ * Extract YouTube video ID from URL
+ * @param {string} url - YouTube URL
+ * @returns {string|null} - Video ID or null if unable to extract
+ */
+function extractVideoId(url) {
+  try {
+    // Try to parse as URL
+    const parsedUrl = new URL(url);
+    
+    // YouTube standard URL (youtube.com/watch?v=VIDEO_ID)
+    if (parsedUrl.hostname.includes('youtube.com')) {
+      // Check for standard watch URL
+      if (parsedUrl.searchParams.has('v')) {
+        return parsedUrl.searchParams.get('v');
+      }
+      
+      // Check for shorts URL (youtube.com/shorts/VIDEO_ID)
+      if (parsedUrl.pathname.includes('/shorts/')) {
+        const shortsMatch = parsedUrl.pathname.match(/\/shorts\/([^\/\?]+)/);
+        if (shortsMatch && shortsMatch[1]) {
+          return shortsMatch[1];
+        }
+      }
+    }
+    
+    // YouTube shortened URL (youtu.be/VIDEO_ID)
+    if (parsedUrl.hostname === 'youtu.be') {
+      return parsedUrl.pathname.substring(1);
+    }
+    
+    // If parsing fails, try regex as fallback
+  } catch (e) {
+    // URL parsing failed, use regex fallback
+  }
+  
+  // Regex fallback for various YouTube URL formats including shorts
+  const regex = /(?:youtube\.com\/(?:shorts\/|[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i;
+  const match = url.match(regex);
+  return match ? match[1] : null;
+}
+
+/**
+ * Check if memory usage exceeds the limit
+ * @returns {boolean} True if memory limit is exceeded, false otherwise
+ */
+function isMemoryLimitExceeded() {
+  if (options.memoryLimit <= 0) {
+    return false; // No limit set
+  }
+  
+  const memUsage = getMemoryUsage();
+  return memUsage.rss > options.memoryLimit;
+}
+
+/**
+ * Log memory usage if verbose mode is enabled
+ */
+function logMemoryUsage() {
+  if (!options.verbose) return;
+  
+  const memUsage = getMemoryUsage();
+  console.log('Memory usage:');
+  console.log(`  Process RSS: ${memUsage.rss}MB`);
+  console.log(`  Heap used: ${memUsage.heapUsed}MB / ${memUsage.heapTotal}MB`);
+  console.log(`  System memory: ${memUsage.freeSystemMemory}MB free of ${memUsage.totalSystemMemory}MB`);
+  
+  if (options.memoryLimit > 0) {
+    console.log(`  Memory limit: ${options.memoryLimit}MB (${Math.round(memUsage.rss / options.memoryLimit * 100)}% used)`);
+  }
+}
+
+/**
+ * Download a segment of a YouTube video based on start time and duration
+ * @param {string} videoId - YouTube video ID
+ * @param {object} videoInfo - Video info from ytdl.getInfo
+ * @param {number} startTime - Start time in seconds
+ * @param {number} duration - Duration in seconds
+ * @param {string} outputPath - Output path for the segment
+ * @param {string} quality - Quality level to download
+ * @returns {Promise<string>} - Path to the downloaded segment
+ */
+async function downloadVideoSegment(videoId, videoInfo, startTime, duration, outputPath, quality = 'auto') {
+  return new Promise(async (resolve, reject) => {
+    try {
+      // Check if segment is already cached
+      const cachedSegmentPath = getCachedSegment(videoId, startTime, duration);
+      if (cachedSegmentPath) {
+        // If we found a cached segment, copy it to the output path
+        fs.copyFileSync(cachedSegmentPath, outputPath);
+        return resolve(outputPath);
+      }
+      
+      console.log(`Downloading segment from ${startTime}s to ${startTime + duration}s...`);
+      
+      // Select format based on quality preference
+      let formats = videoInfo.formats.filter(format => format.hasVideo);
+      
+      // Prefer MP4 format when available for better compatibility
+      const mp4Formats = formats.filter(format => 
+        format.container === 'mp4' || 
+        format.mimeType?.includes('mp4') ||
+        format.mimeType?.includes('h264')
+      );
+      
+      // Use MP4 formats if available, otherwise use all available formats
+      const compatibleFormats = mp4Formats.length > 0 ? mp4Formats : formats;
+      
+      if (options.verbose && mp4Formats.length > 0) {
+        console.log('Found MP4/H.264 formats for better compatibility');
+      }
+      
+      let selectedFormat;
+      
+      // If auto quality, use target width to determine best format
+      if (quality === 'auto') {
+        // Target width from options plus a buffer (1.5x to ensure quality)
+        const targetWidth = Math.min(1920, parseInt(options.width) * 1.5);
+        
+        // Sort by width and find first format with width >= target
+        compatibleFormats.sort((a, b) => a.width - b.width);
+        
+        // Find first format with width >= target or use highest available
+        selectedFormat = compatibleFormats.find(f => f.width >= targetWidth) || compatibleFormats[compatibleFormats.length - 1];
+        
+        if (options.verbose) {
+          console.log(`Auto-selected format: ${selectedFormat.qualityLabel || 'unknown'} (${selectedFormat.width}x${selectedFormat.height})`);
+        }
+      }
+      // Handle specific quality requests
+      else {
+        compatibleFormats.sort((a, b) => a.width - b.width);
+        
+        // Quality selection based on the user's preference
+        const formatCount = compatibleFormats.length;
+        
+        switch (quality) {
+          case 'lowest':
+            selectedFormat = compatibleFormats[0];
+            break;
+          case 'low':
+            selectedFormat = compatibleFormats[Math.floor(formatCount * 0.25)] || compatibleFormats[0];
+            break;
+          case 'medium':
+            selectedFormat = compatibleFormats[Math.floor(formatCount * 0.5)] || compatibleFormats[0];
+            break;
+          case 'high':
+            selectedFormat = compatibleFormats[Math.floor(formatCount * 0.75)] || compatibleFormats[compatibleFormats.length - 1];
+            break;
+          case 'highest':
+            selectedFormat = compatibleFormats[formatCount - 1];
+            break;
+          default:
+            selectedFormat = compatibleFormats[Math.floor(formatCount * 0.5)] || compatibleFormats[0];
+        }
+        
+        if (options.verbose) {
+          console.log(`Selected ${quality} quality format: ${selectedFormat.qualityLabel || 'unknown'} (${selectedFormat.width}x${selectedFormat.height})`);
+        }
+      }
+      
+      // Check format codec/container 
+      const formatInfo = selectedFormat.mimeType || '';
+      const isVP9 = formatInfo.includes('vp9') || formatInfo.includes('webm');
+      const needsTranscode = isVP9 || !formatInfo.includes('mp4');
+      
+      if (options.verbose) {
+        console.log(`Format info: ${formatInfo}`);
+        if (needsTranscode) {
+          console.log('Format requires transcoding for optimal compatibility');
+        }
+      }
+      
+      // Generate a temporary file path for downloading
+      const tempDownloadPath = `${outputPath}.download.mp4`;
+      
+      if (options.verbose) {
+        console.log(`Using format URL: ${selectedFormat.url.substring(0, 100)}...`);
+      }
+      
+      // Create the FFmpeg command
+      const command = ffmpeg(selectedFormat.url)
+        .seekInput(startTime)
+        .duration(duration);
+      
+      // If the format is not mp4 or needs transcoding, transcode to h264 instead of copy
+      if (needsTranscode) {
+        command.outputOptions([
+          // Transcode to h264 for better compatibility
+          '-c:v', 'h264',
+          // Use reasonable quality setting
+          '-crf', '23',
+          // Fast encoding preset
+          '-preset', 'fast'
+        ]);
+      } else {
+        // Just copy the stream if it's already in a compatible format
+        command.outputOptions(['-c:v', 'copy']);
+      }
+      
+      command.output(tempDownloadPath);
+        
+      // Apply threading if specified
+      if (options.threads > 0) {
+        command.outputOptions([`-threads ${options.threads}`]);
+      } else if (options.threads === 0) {
+        const cpuCount = os.cpus().length;
+        command.outputOptions([`-threads ${cpuCount}`]);
+      }
+      
+      command.on('start', (commandLine) => {
+        if (options.verbose) {
+          console.log('FFmpeg segment download command:', commandLine);
+        }
+      })
+      .on('progress', (progress) => {
+        if (options.verbose && progress.percent) {
+          console.log(`Downloading segment: ${Math.floor(progress.percent)}% done`);
+        }
+      })
+      .on('end', () => {
+        console.log('Segment download complete');
+        
+        // Verify the file exists and is not empty
+        if (!fs.existsSync(tempDownloadPath) || fs.statSync(tempDownloadPath).size === 0) {
+          console.error('Error: Downloaded segment is empty or does not exist');
+          return reject(new Error('Downloaded segment is empty or does not exist'));
+        }
+        
+        // Move the downloaded file to the final output path
+        fs.renameSync(tempDownloadPath, outputPath);
+        
+        // Save segment to cache if caching is enabled
+        if (options.cache) {
+          saveCachedSegment(videoId, startTime, duration, outputPath);
+        }
+        
+        resolve(outputPath);
+      })
+      .on('error', (err) => {
+        console.error('Error downloading segment with FFmpeg:', err.message);
+        
+        // Fall back to direct ytdl download
+        console.log('Falling back to full video download method...');
+        
+        // Create a stream from the format
+        const videoStream = ytdl.downloadFromInfo(videoInfo, { format: selectedFormat });
+        const writeStream = fs.createWriteStream(tempDownloadPath);
+        
+        videoStream.pipe(writeStream);
+        
+        videoStream.on('error', (streamErr) => {
+          console.error('Error downloading video stream:', streamErr.message);
+          reject(streamErr);
+        });
+        
+        writeStream.on('finish', () => {
+          console.log('Full video download complete. Extracting segment...');
+          
+          // Create a temporary file for the extracted segment
+          const tempSegmentPath = `${outputPath}.segment.mp4`;
+          
+          // Use FFmpeg to extract the segment from the full video
+          // Always transcode to ensure compatibility
+          ffmpeg(tempDownloadPath)
+            .seekInput(startTime)
+            .duration(duration)
+            .outputOptions([
+              // Transcode to h264 for compatibility
+              '-c:v', 'h264',
+              '-crf', '23',
+              '-preset', 'fast'
+            ])
+            .output(tempSegmentPath)
+            .on('end', () => {
+              // Clean up the original download
+              try {
+                fs.unlinkSync(tempDownloadPath);
+              } catch (e) {
+                // Ignore cleanup errors
+              }
+              
+              // Move the segment to the output path
+              fs.renameSync(tempSegmentPath, outputPath);
+              
+              console.log('Segment extraction and transcoding complete');
+              
+              // Save segment to cache
+              if (options.cache) {
+                saveCachedSegment(videoId, startTime, duration, outputPath);
+              }
+              
+              resolve(outputPath);
+            })
+            .on('error', (extractErr) => {
+              console.error('Error extracting segment:', extractErr.message);
+              
+              // As a last resort, try simpler extraction with copy
+              console.log('Trying simpler extraction as final fallback...');
+              
+              ffmpeg(tempDownloadPath)
+                .seekInput(startTime)
+                .duration(duration)
+                .outputOptions(['-c:v', 'copy'])
+                .output(tempSegmentPath)
+                .on('end', () => {
+                  try {
+                    fs.unlinkSync(tempDownloadPath);
+                  } catch (e) {
+                    // Ignore cleanup errors
+                  }
+                  
+                  fs.renameSync(tempSegmentPath, outputPath);
+                  console.log('Simple segment extraction complete');
+                  
+                  if (options.cache) {
+                    saveCachedSegment(videoId, startTime, duration, outputPath);
+                  }
+                  
+                  resolve(outputPath);
+                })
+                .on('error', (finalErr) => {
+                  console.error('All extraction methods failed:', finalErr.message);
+                  // Still resolve with the full video if all extraction fails
+                  fs.renameSync(tempDownloadPath, outputPath);
+                  resolve(outputPath);
+                })
+                .run();
+            })
+            .run();
+        });
+        
+        writeStream.on('error', (fileErr) => {
+          console.error('Error writing video file:', fileErr.message);
+          reject(fileErr);
+        });
+      })
+      .run();
+      
+    } catch (err) {
+      console.error('Error in downloadVideoSegment:', err.message);
+      reject(err);
+    }
+  });
 }
 
 // Function to check if crossfade is enabled
@@ -682,6 +1361,11 @@ async function run() {
   let usingTempVideo = false;
   let tempFiles = [];
   
+  // Initialize cache if enabled
+  if (options.cache) {
+    initializeCache();
+  }
+  
   // Detect hardware acceleration capabilities
   const hwAccel = await detectHardwareAcceleration();
   
@@ -780,74 +1464,84 @@ async function run() {
       
       console.log('Validating YouTube URL...');
       
-      if (!ytdl.validateURL(options.url)) {
-        console.error('Error: Invalid YouTube URL');
+      // Get video ID from URL
+      const videoId = extractVideoId(options.url);
+      
+      if (!videoId) {
+        console.error('Error: Invalid YouTube URL or could not extract video ID');
         process.exit(1);
+      }
+      
+      if (options.verbose) {
+        console.log(`Extracted video ID: ${videoId}`);
       }
       
       console.log('Fetching video information...');
       
-      // Try to get video info with different options if needed
-      let videoInfo;
-      try {
-        videoInfo = await ytdl.getInfo(options.url, { requestOptions: { headers: { 'User-Agent': 'Mozilla/5.0' } } });
-      } catch (error) {
-        if (options.verbose) {
-          console.error('Error details:', error);
+      // Try to get video info from cache first
+      let videoInfo = getCachedVideoInfo(videoId);
+      
+      // If not in cache, fetch it with retry logic
+      if (!videoInfo) {
+        try {
+          videoInfo = await withRetry(
+            async () => await ytdl.getInfo(options.url, { 
+              requestOptions: { headers: { 'User-Agent': 'Mozilla/5.0' } } 
+            }),
+            DEFAULT_RETRY_ATTEMPTS,
+            DEFAULT_RETRY_DELAY_MS,
+            (err, attempt, max) => {
+              console.warn(`Attempt ${attempt}/${max + 1} to fetch video info failed: ${err.message}`);
+              console.warn(`Retrying in ${Math.round(DEFAULT_RETRY_DELAY_MS * Math.pow(1.5, attempt - 1) / 1000)} seconds...`);
+            }
+          );
+          
+          // Save to cache if successful
+          if (videoInfo && options.cache) {
+            saveCachedVideoInfo(videoId, videoInfo);
+          }
+        } catch (error) {
+          if (options.verbose) {
+            console.error('Error details:', error);
+          }
+          console.error('Failed to fetch video information after multiple attempts.');
+          console.error('YouTube may have changed their API or the video might be restricted.');
+          process.exit(1);
         }
-        console.error('Failed to fetch video information. YouTube may have changed their API or the video might be restricted.');
-        process.exit(1);
       }
       
       console.log(`Processing: ${videoInfo.videoDetails.title}`);
       
-      // Get available formats
-      const formats = videoInfo.formats.filter(format => format.hasVideo && !format.hasAudio);
+      // Calculate download parameters
+      const startTime = parseFloat(options.start);
+      const duration = parseFloat(options.duration);
       
-      if (formats.length === 0) {
-        console.log('No video-only formats found, using format with both video and audio...');
-      }
-      
-      // Select the best format
-      const format = formats.length > 0 
-        ? formats.sort((a, b) => b.width - a.width)[0] 
-        : videoInfo.formats.filter(f => f.hasVideo).sort((a, b) => b.width - a.width)[0];
-      
-      if (!format) {
-        console.error('Error: No suitable video format found');
+      // Download only the segment we need instead of the full video
+      try {
+        videoPath = await downloadVideoSegment(
+          videoId,
+          videoInfo,
+          startTime,
+          // Add a small buffer to ensure we have enough video
+          duration + (isCrossfadeEnabled() ? options.crossfade : 0) + 0.5, 
+          videoPath,
+          options.quality
+        );
+      } catch (error) {
+        console.error('Error downloading video segment:', error.message);
+        if (options.verbose) {
+          console.error('Error details:', error);
+        }
         process.exit(1);
       }
-      
-      console.log('Downloading video...');
-      
-      if (options.verbose) {
-        console.log(`Using format: ${format.qualityLabel || 'unknown'} (${format.width}x${format.height})`);
-      }
-      
-      const videoStream = ytdl.downloadFromInfo(videoInfo, { format });
-      const writeStream = fs.createWriteStream(videoPath);
-      
-      videoStream.pipe(writeStream);
-      
-      // Handle potential download errors
-      videoStream.on('error', (err) => {
-        console.error('Error downloading video:', err.message);
-        process.exit(1);
-      });
-      
-      await new Promise((resolve, reject) => {
-        writeStream.on('finish', resolve);
-        writeStream.on('error', (err) => {
-          console.error('Error writing video file:', err.message);
-          reject(err);
-        });
-      });
       
       // Verify the file was downloaded
       if (!fs.existsSync(videoPath) || fs.statSync(videoPath).size === 0) {
         console.error('Error: Downloaded video file is empty or does not exist');
         process.exit(1);
       }
+      
+      console.log('Video segment ready for processing');
     } 
     // Handle local video file
     else if (options.input) {
