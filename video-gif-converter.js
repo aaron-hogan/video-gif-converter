@@ -77,32 +77,65 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
     const crossfadeDuration = options.crossfade;
     
     return new Promise((resolve, reject) => {
-      // Using a true crossfade effect that will work with standard ffmpeg
+      // DEBUG VERSION with visual aids to show what's happening
       const startTime = parseFloat(options.start);
       
-      // We'll create three segments:
-      // 1. The main video without the end portion that will be crossfaded
-      // 2. The end portion of the main video that we'll fade out
-      // 3. The beginning portion that we'll fade in
-      // By overlaying the fadeout and fadein segments, we get a true crossfade
+      // We'll create separate segments with visual debugging info
       const mainDuration = totalDuration - crossfadeDuration;
       
-      const complexFilter = [
-        // Extract the main clip up to the crossfade point
-        `[0:v]trim=start=${startTime}:duration=${mainDuration},setpts=PTS-STARTPTS[base]`,
+      // Much simpler and more reliable approach for crossfade
+      
+      if (options.verbose) {
+        console.log("Creating debug version with color indicators");
         
-        // Extract the ending segment and add a fade out
-        `[0:v]trim=start=${startTime + mainDuration}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,fade=t=out:st=0:d=${crossfadeDuration}[fadeout]`,
+        // Create a marked version for debugging with color indicators
+        complexFilter = [
+          // Main section (before crossfade) with RED box at top
+          `[0:v]trim=start=${startTime}:duration=${mainDuration},setpts=PTS-STARTPTS,drawbox=x=0:y=0:w=480:h=20:color=red@0.5:t=fill[main]`,
+          
+          // Second part - create a crossfade between end and beginning
+          // We'll add a YELLOW box to the ending segment
+          `[0:v]trim=start=${startTime + mainDuration}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,drawbox=x=0:y=0:w=480:h=20:color=yellow@0.5:t=fill[end]`,
+          
+          // Beginning segment with BLUE box
+          `[0:v]trim=start=${startTime}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,drawbox=x=0:y=0:w=480:h=20:color=blue@0.5:t=fill[begin]`,
+          
+          // Create a true crossfade by using overlay with transparency
+          // First apply fade out to ending segment
+          `[end]format=yuva420p,fade=t=out:st=0:d=${crossfadeDuration}:alpha=1[fout]`,
+          
+          // Apply fade in to beginning segment
+          `[begin]format=yuva420p,fade=t=in:st=0:d=${crossfadeDuration}:alpha=1[fin]`,
+          
+          // Overlay them with the first one below
+          `[fin][fout]overlay[crossfade]`,
+          
+          // Now join the main part with the crossfade
+          `[main][crossfade]concat=n=2:v=1:a=0`
+        ].join(';');
+      } else {
+        // Simplified timecodes with larger font size
+        // Adjust base clip to start after crossfade duration, as per the plan
+        const baseOffset = options.crossfade;
+        console.log(`Base clip starts at: ${startTime + baseOffset}s`);
         
-        // Extract the beginning segment and add a fade in
-        `[0:v]trim=start=${startTime}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,fade=t=in:st=0:d=${crossfadeDuration}[fadein]`,
-        
-        // Overlay the fadeout and fadein segments
-        '[fadeout][fadein]overlay[crossfade]',
-        
-        // Concatenate the base with the crossfade section
-        '[base][crossfade]concat=n=2:v=1:a=0'
-      ].join(';');
+        complexFilter = [
+          // Main section with RED timestamp (start after crossfade)
+          `[0:v]trim=start=${startTime + baseOffset}:duration=${mainDuration},setpts=PTS-STARTPTS,drawtext=text='MAIN %{pts\\:hms}':x=10:y=10:fontsize=36:fontcolor=red:box=1:boxcolor=black@0.5[main]`,
+          
+          // End segment with fade out (no timestamp)
+          `[0:v]trim=start=${startTime + mainDuration + baseOffset}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,format=yuva420p,fade=t=out:st=0:d=${crossfadeDuration}:alpha=1[fout]`,
+          
+          // Beginning segment with BLUE timestamp in top-right
+          `[0:v]trim=start=${startTime}:duration=${crossfadeDuration},setpts=PTS-STARTPTS,drawtext=text='START %{pts\\:hms}':x=w-280:y=10:fontsize=36:fontcolor=blue:box=1:boxcolor=white@0.5,format=yuva420p,fade=t=in:st=0:d=${crossfadeDuration}:alpha=1[fin]`,
+          
+          // Overlay the fading segments
+          `[fin][fout]overlay[crossfade]`,
+          
+          // Join the main part with the crossfade
+          `[main][crossfade]concat=n=2:v=1:a=0`
+        ].join(';');
+      }
       
       ffmpeg(videoPath)
         .complexFilter(complexFilter)
