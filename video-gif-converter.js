@@ -33,12 +33,24 @@ program
   .option('-v, --verbose', 'Enable verbose logging')
   .option('-m, --max-size <mb>', 'Maximum output file size in MB (constrains quality automatically)', '50')
   .option('-c, --crossfade <seconds>', 'Apply crossfade effect for looping, duration in seconds', '0')
+  .option('-p, --speed <factor>', 'Playback speed (0.5 = half speed, 2.0 = double speed)', '1.0')
   .parse(process.argv);
 
 const options = program.opts();
 
-// Convert crossfade option to float
+// Convert numeric options to float
 options.crossfade = parseFloat(options.crossfade);
+options.speed = parseFloat(options.speed);
+
+// Validate speed option
+if (isNaN(options.speed) || options.speed <= 0) {
+  console.error('Error: Speed must be a positive number');
+  process.exit(1);
+}
+
+if (options.speed < 0.25 || options.speed > 4.0) {
+  console.warn('Warning: Speed values outside the range of 0.25-4.0 may produce unexpected results');
+}
 
 // Function to check if crossfade is enabled
 function isCrossfadeEnabled() {
@@ -210,9 +222,53 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
   }
 }
 
+/**
+ * Preprocess video with speed adjustment if needed
+ * @param {string} inputPath - Path to the input video
+ * @param {string} tempDir - Temporary directory for processing
+ * @param {number} speed - Speed factor (1.0 = normal, 0.5 = half speed, 2.0 = double speed)
+ * @returns {Promise<string>} - Path to the processed video
+ */
+async function preprocessVideoSpeed(inputPath, tempDir, speed) {
+  // If speed is 1.0 (normal), skip preprocessing
+  if (speed === 1.0) {
+    return inputPath;
+  }
+
+  return new Promise((resolve, reject) => {
+    const speedAdjustedPath = path.join(tempDir, 'speed_adjusted.mp4');
+    
+    console.log(`Preprocessing video to ${speed}x speed...`);
+    
+    // Apply speed effect using setpts filter
+    // Note: setpts=1/speed*PTS makes the video faster when speed > 1.0 and slower when speed < 1.0
+    ffmpeg(inputPath)
+      .videoFilter(`setpts=1/${speed}*PTS`)
+      .audioFilter(`atempo=${speed}`) // Adjust audio speed too if present
+      .output(speedAdjustedPath)
+      .on('start', (commandLine) => {
+        if (options.verbose) {
+          console.log('Speed preprocessing command:', commandLine);
+        }
+      })
+      .on('end', () => {
+        console.log('Speed preprocessing complete');
+        resolve(speedAdjustedPath);
+      })
+      .on('error', (err) => {
+        console.error('Error preprocessing speed:', err.message);
+        // If speed preprocessing fails, fall back to the original video
+        console.warn('Falling back to original video speed');
+        resolve(inputPath);
+      })
+      .run();
+  });
+}
+
 async function run() {
   let tempDir = null;
   let videoPath = null;
+  let processedVideoPath = null;
   let usingTempVideo = false;
   
   try {
@@ -326,6 +382,10 @@ async function run() {
       fs.mkdirSync(outputDir, { recursive: true });
     }
     
+    // Apply speed preprocessing if needed
+    processedVideoPath = await preprocessVideoSpeed(videoPath, tempDir, options.speed);
+    // From this point on, use processedVideoPath instead of videoPath
+    
     // Check if we have write access to the output directory
     try {
       fs.accessSync(outputDir, fs.constants.W_OK);
@@ -378,8 +438,9 @@ async function run() {
     
     // Check if crossfade is enabled
     if (isCrossfadeEnabled()) {
+      const speedInfo = options.speed !== 1.0 ? `, ${options.speed}x speed` : '';
       console.log(`Creating GIF with crossfade effect of ${options.crossfade}s...`);
-      console.log(`Settings: ${options.duration}s duration, ${options.width}px width, ${options.fps} FPS`);
+      console.log(`Settings: ${options.duration}s duration, ${options.width}px width, ${options.fps} FPS${speedInfo}`);
       
       // Validate that crossfade duration is not longer than total duration
       if (options.crossfade >= parseFloat(options.duration)) {
@@ -390,18 +451,19 @@ async function run() {
       }
       
       // Process with crossfade effect
-      await processCrossfade(videoPath, tempDir, outputPath);
+      await processCrossfade(processedVideoPath, tempDir, outputPath);
     } else {
       // Standard processing without crossfade
       await new Promise(async (resolve, reject) => {
-        console.log('Converting video to GIF (this may take a while)...');
+        const speedInfo = options.speed !== 1.0 ? ` at ${options.speed}x speed` : '';
+        console.log(`Converting video to GIF${speedInfo} (this may take a while)...`);
         console.log(`Settings: ${options.duration}s duration, ${options.width}px width, ${options.fps} FPS`);
         
         // Generate a palette for better quality
         const palettePath = path.join(tempDir, 'palette.png');
         
         // First pass - generate palette with tweaked settings for better performance
-        let ffmpegCommand = ffmpeg(videoPath)
+        let ffmpegCommand = ffmpeg(processedVideoPath)
           .setStartTime(options.start);
           
         // Regular approach
@@ -439,7 +501,7 @@ async function run() {
             console.log('Trying alternative two-pass method...');
             
             // First create palette
-            let alternateFfmpeg = ffmpeg(videoPath)
+            let alternateFfmpeg = ffmpeg(processedVideoPath)
               .setStartTime(options.start);
               
             // For alternate approach, use a simpler palette generation
@@ -459,7 +521,7 @@ async function run() {
                 // Final fallback - simpler method
                 console.log('Using basic conversion as final fallback...');
                 
-                let fallbackFfmpeg = ffmpeg(videoPath)
+                let fallbackFfmpeg = ffmpeg(processedVideoPath)
                   .setStartTime(options.start);
                 
                 // Standard approach
@@ -489,7 +551,7 @@ async function run() {
               })
               .on('end', () => {
                 // Second pass - use palette to create high-quality GIF
-                let secondPassFfmpeg = ffmpeg(videoPath)
+                let secondPassFfmpeg = ffmpeg(processedVideoPath)
                   .setStartTime(options.start);
                   
                 // Standard two-pass approach
@@ -522,7 +584,7 @@ async function run() {
                     // Fall back to the basic method
                     console.log('Using basic conversion as fallback...');
                     
-                    let fallbackFfmpeg = ffmpeg(videoPath)
+                    let fallbackFfmpeg = ffmpeg(processedVideoPath)
                       .setStartTime(options.start);
                     
                     // Original fallback approach

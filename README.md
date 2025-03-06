@@ -67,6 +67,8 @@ vgif --input "path/to/video.mp4"
 - `-l, --loops <count>` - Number of loops (0 = infinite) (default: 0)
 - `-v, --verbose` - Enable verbose logging and show progress information
 - `-m, --max-size <mb>` - Maximum output file size in MB (default: 50)
+- `-c, --crossfade <seconds>` - Apply crossfade effect for seamless looping (default: 0)
+- `-p, --speed <factor>` - Playback speed (0.5 = half speed, 2.0 = double speed) (default: 1.0)
 
 Note: You must provide either a YouTube URL (-u) OR a local file path (-i), not both.
 
@@ -99,6 +101,18 @@ vgif -i "path/to/video.mp4" -f 10 -w 320
 
 # Enable verbose mode to see conversion progress
 vgif -i "path/to/video.mp4" -v
+
+# Create a GIF with seamless looping using crossfade effect
+vgif -i "path/to/video.mp4" -d 10 -c 1.5
+
+# Create a slow-motion GIF (half speed)
+vgif -i "path/to/video.mp4" -p 0.5
+
+# Create a time-lapse style GIF (double speed)
+vgif -i "path/to/video.mp4" -p 2.0
+
+# Combine speed control with crossfade for creative effects
+vgif -i "path/to/video.mp4" -d 8 -p 0.75 -c 1.0
 ```
 
 ### Tips
@@ -107,6 +121,8 @@ vgif -i "path/to/video.mp4" -v
 2. **Duration**: Shorter GIFs (2-8 seconds) tend to be more shareable and load faster
 3. **File Size**: Reducing width (`-w`) and frame rate (`-f`) will create smaller files
 4. **Loop Count**: Use `-l 0` for infinite loops or specify a number for limited loops
+5. **Crossfade Effect**: For seamless looping, try a crossfade duration of 0.5-2 seconds (must be less than total duration)
+6. **Speed Control**: Use `-p 0.5` for slow motion or `-p 2.0` for time-lapse effects
 
 ## License
 
