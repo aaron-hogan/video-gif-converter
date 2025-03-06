@@ -65,6 +65,7 @@ This document outlines our step-by-step plan to optimize the Video GIF Converter
   - [x] 1.2 Remove redundant file operations in the standard flow
   - [x] 1.3 Implement pipeline-based processing for crossfade effect
   - [x] 1.4 Add hardware acceleration detection and usage
+  - [x] 1.5 Fix crossfade effect to properly loop between segment end and beginning
 
 - [x] **Step 2: Resource Management**
   - [x] 2.1 Add immediate temp file cleanup after each processing step
@@ -83,6 +84,7 @@ This document outlines our step-by-step plan to optimize the Video GIF Converter
   - [x] 4.2 Add quality selection based on output requirements
   - [x] 4.3 Create caching system for processed videos
   - [x] 4.4 Implement retry logic for network operations
+  - [x] 4.5 Fix YouTube timestamp seeking (e.g., -s 180) for specific start positions
 
 - [ ] **Step 5: Error Handling Refactoring**
   - [ ] 5.1 Create processing strategy pattern to replace nested fallbacks
