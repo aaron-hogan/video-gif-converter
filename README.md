@@ -46,13 +46,13 @@ npm link
 ### From YouTube
 
 ```bash
-video-gif-converter --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 
+vgif --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 
 ```
 
 ### From Local File
 
 ```bash
-video-gif-converter --input "path/to/video.mp4"
+vgif --input "path/to/video.mp4"
 ```
 
 ### Options
@@ -77,28 +77,28 @@ Note: You must provide either a YouTube URL (-u) OR a local file path (-i), not 
 # ---------------
 
 # Create a 10-second GIF starting from 30 seconds into the video
-video-gif-converter -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -s 30 -d 10
+vgif -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -s 30 -d 10
 
 # Create a high-quality GIF with custom dimensions and fps
-video-gif-converter -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -w 720 -f 30 -o my-gif.gif
+vgif -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -w 720 -f 30 -o my-gif.gif
 
 # Create a GIF that loops 3 times
-video-gif-converter -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -l 3
+vgif -u "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -l 3
 
 # Local File Examples
 # ------------------
 
 # Create a GIF from a local video file
-video-gif-converter -i "path/to/video.mp4" -o output.gif
+vgif -i "path/to/video.mp4" -o output.gif
 
 # Create a GIF from a specific segment of a local video
-video-gif-converter -i "path/to/movie.mp4" -s 120 -d 5 -w 480 -f 20 -o movie-scene.gif 
+vgif -i "path/to/movie.mp4" -s 120 -d 5 -w 480 -f 20 -o movie-scene.gif 
 
 # Create a smaller file size GIF with lower FPS
-video-gif-converter -i "path/to/video.mp4" -f 10 -w 320
+vgif -i "path/to/video.mp4" -f 10 -w 320
 
 # Enable verbose mode to see conversion progress
-video-gif-converter -i "path/to/video.mp4" -v
+vgif -i "path/to/video.mp4" -v
 ```
 
 ### Tips
