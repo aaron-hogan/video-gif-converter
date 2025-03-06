@@ -64,7 +64,7 @@ This document outlines our step-by-step plan to optimize the Video GIF Converter
   - [x] 1.1 Refactor palette generation and GIF creation into a single filtergraph
   - [x] 1.2 Remove redundant file operations in the standard flow
   - [x] 1.3 Implement pipeline-based processing for crossfade effect
-  - [ ] 1.4 Add hardware acceleration detection and usage
+  - [x] 1.4 Add hardware acceleration detection and usage
 
 - [ ] **Step 2: Resource Management**
   - [ ] 2.1 Add immediate temp file cleanup after each processing step

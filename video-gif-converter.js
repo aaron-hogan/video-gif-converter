@@ -106,6 +106,105 @@ function isCrossfadeEnabled() {
   return options.crossfade > 0;
 }
 
+// Function to check if hardware acceleration is available
+async function detectHardwareAcceleration() {
+  return new Promise((resolve) => {
+    // Default hardware acceleration options
+    const hwAccel = {
+      available: false,
+      type: null,
+      filters: [],
+      options: []
+    };
+    
+    try {
+      // Check for platform-specific hardware acceleration
+      const platform = os.platform();
+      if (platform === 'darwin') {
+        // macOS - check for videotoolbox
+        require('child_process').exec('ffmpeg -hwaccels', (error, stdout) => {
+          if (!error && stdout.includes('videotoolbox')) {
+            hwAccel.available = true;
+            hwAccel.type = 'videotoolbox';
+            hwAccel.options = ['-hwaccel', 'videotoolbox'];
+            if (options.verbose) {
+              console.log('Detected macOS VideoToolbox hardware acceleration');
+            }
+          }
+          resolve(hwAccel);
+        });
+      } else if (platform === 'win32') {
+        // Windows - check for multiple options
+        require('child_process').exec('ffmpeg -hwaccels', (error, stdout) => {
+          if (!error) {
+            if (stdout.includes('dxva2')) {
+              hwAccel.available = true;
+              hwAccel.type = 'dxva2';
+              hwAccel.options = ['-hwaccel', 'dxva2'];
+              if (options.verbose) {
+                console.log('Detected Windows DXVA2 hardware acceleration');
+              }
+            } else if (stdout.includes('cuda') || stdout.includes('nvenc')) {
+              hwAccel.available = true;
+              hwAccel.type = 'cuda';
+              hwAccel.options = ['-hwaccel', 'cuda'];
+              if (options.verbose) {
+                console.log('Detected NVIDIA CUDA hardware acceleration');
+              }
+            } else if (stdout.includes('qsv')) {
+              hwAccel.available = true;
+              hwAccel.type = 'qsv';
+              hwAccel.options = ['-hwaccel', 'qsv'];
+              if (options.verbose) {
+                console.log('Detected Intel QuickSync hardware acceleration');
+              }
+            } else if (stdout.includes('d3d11va')) {
+              hwAccel.available = true;
+              hwAccel.type = 'd3d11va';
+              hwAccel.options = ['-hwaccel', 'd3d11va'];
+              if (options.verbose) {
+                console.log('Detected D3D11VA hardware acceleration');
+              }
+            }
+          }
+          resolve(hwAccel);
+        });
+      } else if (platform === 'linux') {
+        // Linux - check for multiple options
+        require('child_process').exec('ffmpeg -hwaccels', (error, stdout) => {
+          if (!error) {
+            if (stdout.includes('vaapi')) {
+              hwAccel.available = true;
+              hwAccel.type = 'vaapi';
+              hwAccel.options = ['-hwaccel', 'vaapi', '-vaapi_device', '/dev/dri/renderD128'];
+              if (options.verbose) {
+                console.log('Detected Linux VAAPI hardware acceleration');
+              }
+            } else if (stdout.includes('cuda') || stdout.includes('nvenc')) {
+              hwAccel.available = true;
+              hwAccel.type = 'cuda';
+              hwAccel.options = ['-hwaccel', 'cuda'];
+              if (options.verbose) {
+                console.log('Detected NVIDIA CUDA hardware acceleration');
+              }
+            }
+          }
+          resolve(hwAccel);
+        });
+      } else {
+        // Unknown platform or no acceleration
+        resolve(hwAccel);
+      }
+    } catch (err) {
+      // If detection fails, just proceed without hardware acceleration
+      if (options.verbose) {
+        console.warn('Hardware acceleration detection failed:', err.message);
+      }
+      resolve(hwAccel);
+    }
+  });
+}
+
 // Validate that either URL or input file is provided
 if (!options.url && !options.input) {
   console.error('Error: You must provide either a YouTube URL (-u, --url) or a local video file path (-i, --input)');
@@ -226,7 +325,17 @@ async function processCrossfade(videoPath, tempDir, outputPath) {
           console.log('Creating optimized GIF with single-pass filtergraph...');
           
           // Use a single complex filtergraph for palette generation and application
-          ffmpeg(tempVideoPath)
+          let ffmpegCrossfade = ffmpeg(tempVideoPath);
+          
+          // Apply hardware acceleration if available
+          if (hwAccel.available) {
+            console.log(`Using ${hwAccel.type} hardware acceleration for crossfade`);
+            hwAccel.options.forEach(option => {
+              ffmpegCrossfade.inputOption(option);
+            });
+          }
+          
+          ffmpegCrossfade
             .complexFilter([
               // Set FPS and scale the video
               `fps=${options.fps},scale=${options.width}:-1:flags=lanczos,split[s0][s1]`,
@@ -410,6 +519,9 @@ async function run() {
   let videoPath = null;
   let processedVideoPath = null;
   let usingTempVideo = false;
+  
+  // Detect hardware acceleration capabilities
+  const hwAccel = await detectHardwareAcceleration();
   
   try {
     // Create temp directory
@@ -647,6 +759,14 @@ async function run() {
         let ffmpegCommand = ffmpeg(processedVideoPath)
           .setStartTime(options.start)
           .duration(options.duration);
+          
+        // Apply hardware acceleration if available
+        if (hwAccel.available) {
+          console.log(`Using ${hwAccel.type} hardware acceleration`);
+          hwAccel.options.forEach(option => {
+            ffmpegCommand.inputOption(option);
+          });
+        }
           
         // Use a single complex filtergraph that generates a palette and applies it in one step
         // This eliminates the need for temporary palette files and multiple passes
