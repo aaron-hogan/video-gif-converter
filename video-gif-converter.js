@@ -186,7 +186,7 @@ async function run() {
       }
     }
     
-    await new Promise((resolve, reject) => {
+    await new Promise(async (resolve, reject) => {
       // Let's use a simpler approach first to see if it works
       console.log('Converting video to GIF (this may take a while)...');
       
@@ -238,37 +238,51 @@ async function run() {
         .setStartTime(options.start);
         
       if (hasCrossfade && parseFloat(options.duration) > crossfadeDuration * 2) {
-        // For crossfade, we need to create a special filter chain
-        // This will create a transition between the end and beginning of the video
+        // For crossfade, create a proper looping segment by duplicating the video
+        // and creating a smooth transition between copies
         
         const actualDuration = parseFloat(options.duration);
         
+        // Create a temporary video file to hold our looping segment
+        const loopSegmentPath = path.join(tempDir, 'loop_segment.mp4');
+        
+        // First create our looping segment
+        try {
+          await new Promise((resolveSegment, rejectSegment) => {
+          // Extract the base segment first
+          ffmpeg(videoPath)
+            .setStartTime(options.start)
+            .duration(actualDuration)
+            .output(loopSegmentPath)
+            .on('end', resolveSegment)
+            .on('error', rejectSegment)
+            .run();
+          });
+        } catch (segmentError) {
+          console.error('Error creating loop segment:', segmentError.message);
+          reject(segmentError);
+          return;
+        }
+        
+        // Now create the GIF with the seamless crossfade loop
+        ffmpegCommand = ffmpeg();
+        
+        // Input the same segment twice
         ffmpegCommand
-          .duration(actualDuration)
+          .input(loopSegmentPath)
+          .input(loopSegmentPath)
           .complexFilter([
-            // Set framerate and scale
-            `[0:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos[scaled]`,
+            // Process the first segment
+            `[0:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos,trim=0:${actualDuration - crossfadeDuration/2}[first]`,
             
-            // Split into three parts: beginning for the crossfade, middle content, end content
-            `[scaled]split=3[begin][middle][end]`,
+            // Process the second segment
+            `[1:v]fps=${options.fps},scale=${options.width}:-1:flags=lanczos,trim=0:${actualDuration}[second]`,
             
-            // Prepare beginning segment for crossfade
-            `[begin]trim=0:${crossfadeDuration},setpts=PTS-STARTPTS[begin_seg]`,
+            // Create crossfade between the two segments
+            `[first][second]xfade=transition=fade:duration=${crossfadeDuration}:offset=${actualDuration - crossfadeDuration}[merged]`,
             
-            // Prepare the middle section
-            `[middle]trim=${crossfadeDuration}:${actualDuration - crossfadeDuration},setpts=PTS-STARTPTS[mid_seg]`,
-            
-            // Prepare end segment for crossfade
-            `[end]trim=${actualDuration - crossfadeDuration}:${actualDuration},setpts=PTS-STARTPTS[end_seg]`,
-            
-            // Create crossfade transition
-            `[end_seg][begin_seg]blend=all_expr='A*(T/${crossfadeDuration})+B*(1-T/${crossfadeDuration})'[xfade]`,
-            
-            // Concatenate middle with crossfade
-            `[mid_seg][xfade]concat=n=2:v=1:a=0[final]`,
-            
-            // Generate palette from the final video
-            `[final]split[s0][s1]`,
+            // Generate palette from the merged result
+            `[merged]split[s0][s1]`,
             `[s0]palettegen=stats_mode=diff[p]`,
             `[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle[out]`
           ], '[out]')
@@ -315,28 +329,12 @@ async function run() {
           let alternateFfmpeg = ffmpeg(videoPath)
             .setStartTime(options.start);
             
-          // Check if crossfade is enabled
-          if (hasCrossfade && parseFloat(options.duration) > crossfadeDuration * 2) {
-            // For alternate approach with crossfade
-            const actualDuration = parseFloat(options.duration);
-            
-            alternateFfmpeg
-              .duration(actualDuration)
-              .complexFilter([
-                // Basic setup
-                `fps=${options.fps},scale=${options.width}:-1:flags=lanczos`,
-                
-                // Create a palette for the crossfaded video
-                `palettegen=stats_mode=diff`
-              ])
-              .output(palettePath);
-          } else {
-            // Standard approach without crossfade
-            alternateFfmpeg
-              .duration(options.duration)
-              .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen`)
-              .output(palettePath);
-          }
+          // For alternate approach, use a simpler palette generation
+          // regardless of crossfade (the actual crossfade will be handled in second pass)
+          alternateFfmpeg
+            .duration(parseFloat(options.duration))
+            .videoFilter(`fps=${options.fps},scale=${options.width}:-1:flags=lanczos,palettegen=stats_mode=diff`)
+            .output(palettePath);
             
           alternateFfmpeg.on('start', (commandLine) => {
             if (options.verbose) {
