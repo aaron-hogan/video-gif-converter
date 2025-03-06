@@ -2,6 +2,8 @@
 
 A command-line tool to convert YouTube videos or local video files to looping GIFs.
 
+[![GitHub repo](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/aaron-hogan/video-gif-converter)
+
 ## Prerequisites
 
 - Node.js (12.x or higher)
